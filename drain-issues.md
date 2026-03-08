@@ -1,0 +1,523 @@
+---
+allowed-tools: Bash(git:*), Bash(gh:*), Task
+argument-hint: [label:filter] [--max-parallel=N] [--dry-run]
+description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done
+---
+
+# Autonomous Issue Drainer
+
+## Context
+
+Repository:
+!`git remote get-url origin`
+
+Current branch:
+!`git branch --show-current`
+
+---
+
+## Input Parsing
+
+Arguments: **$ARGUMENTS**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `label:<name>` | (none) | Only process issues with this label |
+| `--max-parallel=N` | 2 | Max concurrent subagents (keep low to avoid context overflow) |
+| `--dry-run` | false | Analyze only, don't process |
+| `--no-merge` | false | Review PRs but don't auto-merge |
+| `--skip-review` | false | Create PRs without review/merge |
+| `--full-review` | false | Use Claude↔Codex review loop instead of basic review. Codex reviews each PR, Claude fixes issues, repeat until approved (max 15 iterations per PR). Much more thorough but slower (~5-15 min per PR). |
+
+---
+
+## CRITICAL: Context Management
+
+**Problem:** Multiple parallel agents returning results can overflow context before auto-compact triggers.
+
+**Solution:** This command uses a staged approach:
+
+1. **Small batches:** Default max-parallel is 2, max 3
+2. **Minimal agent output:** Agents return only structured JSON, not verbose logs
+3. **Wave isolation:** Each wave keeps results minimal. Context auto-compacts as needed.
+4. **Temp file persistence:** Wave results are saved to temp files so they survive compaction
+
+---
+
+## Phase 1: Fetch All Open Issues
+
+```bash
+# Get all open issues with full details
+gh issue list --state open --json number,title,body,labels --limit 50
+```
+
+If a label filter was provided:
+```bash
+gh issue list --state open --label "<label>" --json number,title,body,labels --limit 50
+```
+
+---
+
+## Phase 2: Dependency Analysis
+
+For each issue, analyze for dependencies:
+
+### Dependency Indicators
+
+1. **Explicit references:** Issue mentions `#<number>`, "depends on", "blocked by", "after #X"
+2. **Shared files:** Issues that likely touch the same files (based on description)
+3. **Sequential requirements:** "Step 2 of...", "Follow-up to..."
+4. **Feature dependencies:** Issue B needs feature from Issue A
+
+### Analysis Process
+
+```
+For each issue:
+  1. Read issue body for explicit issue references (#XX)
+  2. Extract mentioned files/components
+  3. Look for dependency keywords
+  4. Build dependency graph
+```
+
+### Dependency Graph Output
+
+```
+Issue Dependency Analysis:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Independent (can run in parallel):
+  #12 - Fix login timeout
+  #15 - Add dark mode toggle
+  #22 - Update docs
+
+Dependent chains:
+  #18 → #24 (18 must complete first)
+  #31 → #32 → #35 (sequential chain)
+
+Unclear (need manual review):
+  #28 - May conflict with #12 (both touch auth/)
+```
+
+---
+
+## Phase 3: Wave Planning
+
+Group independent issues into waves:
+
+```
+Wave 1: [#12, #15, #22, #41] - 4 independent issues
+Wave 2: [#18, #28, #33] - 3 issues (after wave 1 deps resolve)
+Wave 3: [#24, #32] - 2 issues (depend on wave 2)
+Wave 4: [#35] - 1 issue (depends on wave 3)
+
+Total: 4 waves to process 10 issues
+```
+
+**Present the wave plan to the user and wait for confirmation before proceeding.**
+
+---
+
+## Phase 4: Process Current Wave
+
+For each issue in the current wave, launch parallel subagents:
+
+```
+Launch N parallel Task agents (respecting --max-parallel):
+
+Each agent receives:
+"Process issue #XX end-to-end:
+- Detect default branch: git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo 'main'
+- Create worktree ../fix-XX-<short-desc> from origin/<default-branch>
+- Read and understand the issue fully
+- Identify ROOT CAUSE (not surface-level symptoms — no z-index hacks, no retry loops without understanding why)
+- Write a failing test that reproduces the bug
+- Create a brief implementation plan
+- Implement the fix/feature with minimal changes
+- Run tests (new test should pass, full suite should pass)
+- Update CHANGELOG.md if one exists (add entry under [Unreleased])
+- Stage specific files (never use git add -A)
+- Create atomic commit (NO Co-Authored-By)
+- Create PR linked to issue (NO Claude attribution)
+- Self-review the changes
+
+IMPORTANT - Return ONLY this minimal JSON (no other text):
+{\"issue\": XX, \"pr\": <number|null>, \"status\": \"success|failed\", \"error\": \"<short error if failed>\"}"
+```
+
+### Process in Sub-Batches (Context Safety)
+
+If wave has 4+ issues, split into sub-batches of 2:
+
+```
+Wave 1 has 6 issues: [#12, #15, #22, #41, #28, #33]
+
+Sub-batch 1: Process #12, #15 in parallel
+  → Collect minimal results
+
+Sub-batch 2: Process #22, #41 in parallel
+  → Collect minimal results
+
+Sub-batch 3: Process #28, #33 in parallel
+  → Collect minimal results
+```
+
+---
+
+## Phase 5: Wave Results
+
+After wave completes, aggregate PR creation results:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Wave 1 - PR Creation Results
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+| Issue | Title              | PR   | Status |
+|-------|--------------------|------|--------|
+| #12   | Fix login timeout  | #45  | ✅     |
+| #15   | Add dark mode      | #46  | ✅     |
+| #22   | Update docs        | #47  | ✅     |
+| #41   | Refactor utils     | -    | ❌     |
+
+PRs Created: 3/4
+Failed: #41 - Test failures in utils.test.ts
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## Phase 6: Review & Auto-Merge (SEQUENTIAL)
+
+**CRITICAL: Review and merge each PR one at a time. Do NOT batch reviews.**
+
+### Review Mode Selection
+
+There are two review modes. Select based on the `--full-review` flag:
+
+- **Default (basic review):** Uses `/review-changes` — Claude reviews the diff for breaking changes, regressions, missing changelog, etc. Fast (~1-2 min per PR).
+- **`--full-review` mode:** Uses the Claude↔Codex review loop — Codex reviews the PR, Claude fixes any [P1]/[P2] issues, repeat until Codex approves (max 15 iterations). Much more thorough but slower (~5-15 min per PR). Codex receives iteration history so it won't re-raise dismissed issues.
+
+### Review Loop
+
+For each PR created in this wave, do this loop:
+
+```
+for each PR in [#45, #46, #47]:
+
+  1. REVIEW the PR:
+
+     If --full-review mode:
+       Run the full Claude↔Codex review loop for this PR:
+
+       a. Get the PR number
+       b. Execute the /full-review workflow inline:
+          - Get PR info and checkout the branch
+          - Initialize iteration history
+          - Run Codex review with `codex exec` (including iteration history context on rounds 2+)
+          - Parse review for [P1]/[P2] issues
+          - Fix issues, commit, push
+          - Update iteration history with outcomes (FIXED/DISMISSED)
+          - Repeat until Codex approves or 15 iterations
+       c. Record the final result (approved / max iterations reached)
+
+       NOTE: The /full-review loop handles its own fix-commit-push cycle.
+       After the loop completes, the PR is either clean (Codex approved) or
+       has been iterated to convergence.
+
+     If basic review mode (default):
+       Run /review-changes
+       This checks: changelog, debug code, secrets, breaking changes, regressions
+
+  2. IMMEDIATELY after review:
+
+     If APPROVED (basic review passed, or Codex approved in full-review):
+       ```bash
+       # Leave a COMMENT review (can't self-approve on GitHub)
+       gh pr review <PR> --comment --body "Review passed: no breaking changes, no debug code, tests pass, root cause addressed"
+       gh pr merge <PR> --rebase --delete-branch
+       ```
+       → Log: "PR #XX merged successfully"
+
+     If REJECTED (basic review found issues, or Codex hit max iterations with unresolved [P1]s):
+       ```bash
+       gh pr review <PR> --comment --body "<issue found - needs fix before merge>"
+       ```
+       → Log: "PR #XX needs attention: <reason>"
+       → Create GitHub issue for non-blocking findings: `gh issue create --title "[Review] <finding>" --body "Found during review of PR #XX"`
+
+  3. Move to next PR
+```
+
+### Example Execution
+
+```
+PRs to review: [#45, #46, #47]
+
+─── PR #45 ───
+Run: review changes via git diff
+Result: ✅ SAFE TO MERGE - no breaking changes, changelog present
+Action: gh pr merge 45 --squash --delete-branch
+Result: ✅ PR #45 merged
+
+─── PR #46 ───
+Run: review changes via git diff
+Result: ❌ NEEDS CHANGES - Missing changelog entry
+Action: gh pr comment 46 --body "Needs CHANGELOG entry before merge"
+Result: ⚠️ PR #46 queued for manual fix
+
+─── PR #47 ───
+Run: review changes via git diff
+Result: ✅ SAFE TO MERGE - no issues found
+Action: gh pr merge 47 --squash --delete-branch
+Result: ✅ PR #47 merged
+```
+
+### Merge Command (Copy-Paste Ready)
+
+```bash
+# NOTE: Cannot self-approve PRs on GitHub, so skip approval and merge directly
+# If admin/merge without approval is enabled:
+gh pr merge <NUMBER> --rebase --delete-branch
+
+# If repo requires approval, add a comment instead:
+gh pr comment <NUMBER> --body "Self-review passed: changelog present, no debug code, no secrets"
+gh pr merge <NUMBER> --rebase --delete-branch --admin
+```
+
+### Handling Self-Authored PRs
+
+**Problem:** GitHub won't let you approve your own PR.
+
+**Solutions:**
+
+1. **If you have admin rights:** Use `--admin` flag to bypass approval requirement
+   ```bash
+   gh pr merge <NUMBER> --rebase --delete-branch --admin
+   ```
+
+2. **If repo allows merge without approval:** Just merge directly
+   ```bash
+   gh pr merge <NUMBER> --rebase --delete-branch
+   ```
+
+3. **If approval is required:** Leave comment and skip merge (manual step needed)
+   ```bash
+   gh pr comment <NUMBER> --body "Automated review passed - ready for human approval"
+   ```
+   → Log PR as "awaiting human approval"
+
+### After All PRs in Wave Reviewed
+
+Track results as you go:
+
+```
+Wave 1 Review Summary:
+━━━━━━━━━━━━━━━━━━━━━━
+
+✅ PR #45 (Issue #12) - merged
+✅ PR #47 (Issue #22) - merged
+⚠️ PR #46 (Issue #15) - needs changelog
+
+Merged: 2
+Needs attention: 1
+```
+
+### Clean Up Merged Worktrees
+
+After each successful merge:
+
+```bash
+# Clean up the worktree for merged PR
+git worktree remove ../fix-<issue>-* 2>/dev/null || true
+git worktree prune
+```
+
+---
+
+## Phase 7: Wave Summary & Decision
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Wave 1 Complete
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Issues processed:  4
+PRs created:       3
+PRs reviewed:      3
+Auto-merged:       2
+Needs attention:   1
+
+Issues closed:     2 (#12, #15)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### Decision Logic
+
+- **All merged:** Proceed to next wave
+- **Some need attention:**
+  - Log them for manual review later
+  - Continue with next wave (don't block independent work)
+- **Critical failure (>50% failed review):** Pause and ask for guidance
+
+---
+
+## Phase 8: Context Clear & Continue
+
+**IMPORTANT:** Keep agent outputs minimal (JSON only) to prevent context overflow. Context auto-compacts when needed.
+
+### After Wave Completes
+
+1. Save wave results to a temp file (for reference across waves):
+   ```bash
+   echo '{"wave": 1, "merged": [45,46], "failed": [47]}' > /tmp/drain-wave-1.json
+   ```
+
+2. Check remaining issues:
+   ```bash
+   gh issue list --state open --json number,title --limit 50
+   ```
+
+4. If issues remain → Continue to next wave
+
+### Loop Continuation Message
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Wave 1 Complete
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Merged: #45, #46
+Failed: #47 (needs changelog)
+Remaining issues: 6
+
+Continuing to Wave 2...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## Phase 9: Final Summary (When Complete)
+
+When no issues remain:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+All Issues Drained!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Total waves:           4
+Total issues:          10
+PRs created:           9
+PRs auto-merged:       7
+PRs need attention:    2
+
+Issues closed:         7
+Issues still open:     3 (failed/blocked)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PRs Needing Manual Review:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PR #47 (Issue #22) - Missing changelog
+PR #52 (Issue #31) - Test failures
+
+View all: gh pr list --author "@me" --state open
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Failed Issues (Need Investigation):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#41 - Could not create PR (test failures)
+#35 - Blocked by dependency
+
+View: gh issue list --state open
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Cleanup:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+git worktree list | grep fix- | awk '{print $1}' | xargs -I {} git worktree remove {}
+git worktree prune
+git fetch --prune
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## Dry Run Mode
+
+If `--dry-run` is specified, only perform analysis:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Dry Run Analysis
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Open issues: 10
+
+Dependency analysis:
+- Independent: 4 issues
+- Dependent chains: 2 chains (6 issues)
+
+Estimated waves: 4
+Wave breakdown:
+  Wave 1: #12, #15, #22, #41
+  Wave 2: #18, #28, #33
+  Wave 3: #24, #32
+  Wave 4: #35
+
+No changes made (dry run).
+Run without --dry-run to process.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## Safety Features
+
+1. **Max 3 parallel agents** (default 2) - Prevent system overload and context overflow
+2. **Confirmation before each wave** - User can abort
+3. **Automatic pause on high failure rate** - >50% failures stops processing
+4. **Worktree isolation** - Each issue in separate worktree
+5. **No force operations** - Safe git operations only
+
+---
+
+## Usage Examples
+
+```bash
+# Process all open issues in waves (full automation)
+/drain-issues
+
+# Only process bugs
+/drain-issues label:bug
+
+# Analyze dependencies without processing
+/drain-issues --dry-run
+
+# Limit parallelism
+/drain-issues --max-parallel=2
+
+# Review PRs but merge manually
+/drain-issues --no-merge
+
+# Just create PRs, skip review (faster but less safe)
+/drain-issues --skip-review
+
+# Combine options
+/drain-issues label:enhancement --max-parallel=3 --dry-run
+
+# Full automation for bugs only
+/drain-issues label:bug --max-parallel=4
+
+# Thorough review with Claude↔Codex loop (slower but catches more)
+/drain-issues --full-review
+
+# Full automation with Codex review for critical bugs
+/drain-issues label:bug --full-review
+
+# Codex review without auto-merge (review only)
+/drain-issues --full-review --no-merge
+```
