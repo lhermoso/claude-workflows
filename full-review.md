@@ -64,7 +64,9 @@ INSTRUCTIONS:
 - If a previously raised issue was fixed incorrectly, you may re-raise it with details on what's still wrong.
 ```
 
-Run the Codex review using `codex exec` with the constructed prompt and parse the output:
+Run the Codex review using `codex exec` with the constructed prompt and parse the output.
+
+**IMPORTANT:** Use Codex's default model. Do **not** pass `--model` and do **not** pass `-c model=...`.
 
 ```bash
 codex exec "$REVIEW_PROMPT" --base "origin/$BASE_BRANCH" --title "$(gh pr view $ARGUMENTS --json title -q '.title')" --full-auto --ephemeral --json 2>/dev/null

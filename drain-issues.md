@@ -215,6 +215,7 @@ for each PR in [#45, #46, #47]:
           - Get PR info and checkout the branch
           - Initialize iteration history
           - Run Codex review with `codex exec` (including iteration history context on rounds 2+)
+          - Use Codex's default model only; do not pass `--model` or `-c model=...`
           - Parse review for [P1]/[P2] issues
           - Fix issues, commit, push
           - Update iteration history with outcomes (FIXED/DISMISSED)

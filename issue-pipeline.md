@@ -149,7 +149,8 @@ Run the full Claude↔Codex review loop for this PR inline:
    a. Build Codex prompt:
       - Iteration 1: `review`
       - Iteration N>1: Include `ITERATION_HISTORY` with instructions to skip dismissed/fixed issues
-   b. Run Codex: `codex exec "$REVIEW_PROMPT" --base "origin/$BASE_BRANCH" --title "..." --full-auto --ephemeral --json 2>/dev/null`
+   b. Run Codex with the default model only: `codex exec "$REVIEW_PROMPT" --base "origin/$BASE_BRANCH" --title "..." --full-auto --ephemeral --json 2>/dev/null`
+      Do not pass `--model` or `-c model=...`.
    c. Parse JSONL output for the last `agent_message` text
    d. If no [P1]/[P2] issues → **APPROVED**, break
    e. Fix [P1]/[P2] issues, commit, push
