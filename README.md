@@ -286,20 +286,31 @@ Full pipeline: create an issue (if needed), fix it, create a PR, and self-review
 # With Codex review loop
 /issue-pipeline 42 --full-review
 /issue-pipeline add dark mode toggle --full-review
+
+# With plan refinement loop before implementation
+/issue-pipeline 42 --plan-review
+
+# Full gauntlet: plan review + Codex review loop
+/issue-pipeline 42 --plan-review --full-review
 ```
 
 **Options:**
 
 | Flag | Description |
 |------|-------------|
-| `--full-review` | Use Claude↔Codex iterative review instead of basic review |
+| `--plan-review` | Claude↔Codex plan refinement loop before implementation (up to 3 rounds) |
+| `--full-review` | Claude↔Codex iterative review loop after implementation |
 
 **How it works:**
 1. **Detects mode:** number → fix existing issue; text → create new issue first
 2. **Creates issue** (if text input): auto-detects type from keywords (bug/feature/enhancement)
-3. **Spawns a subagent** that: creates worktree → investigates root cause → writes failing test → implements fix → runs tests → updates changelog → commits → creates PR
-4. **Reviews the PR:** basic review (default) or Claude↔Codex loop (`--full-review`)
-5. **Merges if safe**, or reports what needs attention
+3. **Sharpens the problem statement:** Codex pre-analyzes the issue and produces a precise problem statement (root cause hypothesis, affected files, edge cases, success criteria)
+4. **Spawns a subagent** that: creates worktree → investigates root cause → writes failing test → creates implementation plan
+5. **Plan review loop** (`--plan-review`): Codex reviews the plan and flags issues → Claude refines → repeat up to 3 rounds → implement with the best plan
+6. **Implements** the fix with minimal changes → runs tests + linter → updates changelog → commits → creates PR
+7. **Reviews the PR:** basic review (default) or Claude↔Codex loop (`--full-review`)
+8. **Improvement passes:** up to 2 Codex-powered quality passes on the finished implementation (better abstractions, naming, edge cases)
+9. **Merges if safe**, or reports what needs attention
 
 ---
 
@@ -356,6 +367,7 @@ Open Claude Code and type `/` — you should see the commands in autocomplete.
 
 - **Git worktrees for isolation** — `/fix-issue`, `/quick-fix`, `/batch-issues`, and `/drain-issues` create worktrees so you can work on multiple issues in parallel without conflicts
 - **Full issue context** — Commands fetch the issue body *and all comments* before touching code. Reproduction steps, design decisions, and constraints often live in the thread, not the original description
+- **Plan before building** — `/issue-pipeline --plan-review` runs a Claude↔Codex refinement loop on the implementation plan before writing a single line of code. Up to 3 rounds: original plan → Codex critique → Claude refines
 - **Root cause over surface fixes** — Commands explicitly warn against z-index hacks, retry loops, and other band-aids. They push for understanding *why* before fixing
 - **Test-driven fixes** — Write a failing test first, then implement the fix
 - **Conventional commits** — All commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) spec
