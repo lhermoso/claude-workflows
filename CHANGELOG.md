@@ -1,0 +1,49 @@
+# Changelog
+
+All notable changes to claude-workflows are documented here.
+
+Format: `[version] - YYYY-MM-DD`
+Types: `Added`, `Changed`, `Fixed`, `Removed`
+
+---
+
+## [Unreleased]
+
+## [1.1.0] - 2026-03-13
+
+### Added
+
+- **`/drain-issues`**: Self-assign issues at wave start — claims all issues in the wave before launching subagents, preventing conflicts in team environments
+- **`/drain-issues`**: Assignment filter — skips issues already assigned to someone else by default
+- **`/drain-issues`**: `--get-all` flag — override the assignment filter and process all open issues regardless of who they are assigned to
+- **All issue commands**: Full comment context — `gh issue view` now fetches `comments` field so agents read the full issue thread (body + all comments) before touching code. Affected: `/drain-issues`, `/quick-fix`, `/batch-issues`, `/issue-pipeline`
+- **README**: New design principle — *Full issue context*
+- **CHANGELOG.md**: This file
+
+### Changed
+
+- **`/drain-issues` Phase 1**: Fetch payload now includes `assignees` and `comments` fields
+- **`/drain-issues` Phase 4**: New Step 4.0 runs `gh issue edit --add-assignee @me` for every issue before subagents start
+- **`/batch-issues`**: Subagent prompt now explicitly fetches issue with comments before analysis
+- **`/issue-pipeline`**: Fix phase subagent now fetches comments as a dedicated step
+- **`/quick-fix`**: Context fetch updated to include `comments` in `--json` fields
+- **README**: `/drain-issues` how-it-works steps and options table updated
+
+---
+
+## [1.0.0] - 2026-02-01
+
+### Added
+
+- `/commit` — Stage changes and create conventional commits
+- `/pr` — Create detailed PRs with documentation and changelog
+- `/fix-issue` — End-to-end issue fix with worktrees and TDD
+- `/quick-fix` — Autonomous fix with minimal checkpoints
+- `/create-issue` — Create well-structured GitHub issues
+- `/review-pr` — Review a PR for changelog alignment and merge safety
+- `/review-changes` — Meticulous diff review for breaking changes and regressions
+- `/scan-debt` — Scan for tech debt, code smells, and security issues
+- `/batch-issues` — Process multiple issues in parallel using subagents
+- `/drain-issues` — Dependency-aware wave processing until backlog is empty
+- `/issue-pipeline` — Full pipeline: create issue → fix → PR → review
+- `/full-review` — Claude ↔ Codex iterative review loop

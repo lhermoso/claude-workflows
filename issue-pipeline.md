@@ -84,7 +84,8 @@ Use the Task tool to spawn a subagent with the following prompt:
 Instructions:
 1. Detect default branch: git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo 'main'
 2. Create a git worktree from origin/<default-branch>
-3. Read and understand the issue fully
+3. Fetch the full issue including all comments: `gh issue view <number> --json number,title,body,labels,comments`
+   Read the issue body AND all comments — comments often contain reproduction steps, clarifications, or constraints that are critical to the correct solution.
 4. Investigate the codebase to find ROOT CAUSE — do NOT apply surface-level fixes (z-index hacks, retry loops, overflow-hidden). Ask 'why does this happen?' until you reach the actual cause.
 5. Write a failing test that reproduces the bug
 6. Create a brief implementation plan

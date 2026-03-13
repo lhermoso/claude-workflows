@@ -73,7 +73,8 @@ For issue #12, #15, #18 - Launch 3 parallel Task agents:
 Task 1: "Process issue #12 end-to-end:
 - Detect default branch: git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo 'main'
 - Create worktree ../fix-12-<desc> from origin/<default-branch>
-- Understand the issue
+- Fetch full issue with comments: `gh issue view 12 --json number,title,body,labels,comments`
+- Read the issue body AND all comments — comments often contain reproduction steps, clarifications, or constraints
 - Identify ROOT CAUSE (not surface-level symptoms)
 - Write a failing test that reproduces the bug
 - Create a brief implementation plan

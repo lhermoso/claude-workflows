@@ -1,6 +1,6 @@
 ---
 allowed-tools: Bash(git:*), Bash(gh:*), Task
-argument-hint: [label:filter] [--max-parallel=N] [--dry-run]
+argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all]
 description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done
 ---
 
@@ -28,6 +28,7 @@ Arguments: **$ARGUMENTS**
 | `--no-merge` | false | Review PRs but don't auto-merge |
 | `--skip-review` | false | Create PRs without review/merge |
 | `--full-review` | false | Use Claude↔Codex review loop instead of basic review. Codex reviews each PR, Claude fixes issues, repeat until approved (max 15 iterations per PR). Much more thorough but slower (~5-15 min per PR). |
+| `--get-all` | false | Process all open issues regardless of who is assigned. Without this flag, issues already assigned to someone else are skipped. |
 
 ---
 
@@ -47,13 +48,34 @@ Arguments: **$ARGUMENTS**
 ## Phase 1: Fetch All Open Issues
 
 ```bash
-# Get all open issues with full details
-gh issue list --state open --json number,title,body,labels --limit 50
+# Get all open issues with full details (including assignees)
+gh issue list --state open --json number,title,body,labels,assignees --limit 50
 ```
 
 If a label filter was provided:
 ```bash
-gh issue list --state open --label "<label>" --json number,title,body,labels --limit 50
+gh issue list --state open --label "<label>" --json number,title,body,labels,assignees --limit 50
+```
+
+### Assignment Filtering
+
+After fetching, get your own GitHub username:
+```bash
+gh api user --jq '.login'
+```
+
+Then filter the issue list:
+
+- **Default behavior:** Skip any issue where `assignees` is non-empty AND none of the assignees is you. These belong to someone else — don't touch them.
+- **`--get-all` mode:** Include all issues regardless of assignment. Issues assigned to others are still claimed (you'll be added as assignee in Phase 4).
+- **Unassigned issues** (empty `assignees`): always included.
+- **Issues already assigned to you:** always included.
+
+Log any skipped issues clearly:
+```
+Skipped (assigned to others):
+  #17 - Refactor auth middleware  [assigned: alice]
+  #23 - Fix payment bug           [assigned: bob, carol]
 ```
 
 ---
@@ -119,6 +141,21 @@ Total: 4 waves to process 10 issues
 
 ## Phase 4: Process Current Wave
 
+### Step 4.0: Claim Issues (Self-Assign)
+
+Before launching any subagents, assign yourself to every issue in this wave:
+
+```bash
+# Assign yourself to all issues in the wave before starting work
+for issue in <wave-issue-numbers>; do
+  gh issue edit $issue --add-assignee @me
+done
+```
+
+This marks the issues as in-progress so other contributors (or other `/drain-issues` sessions) don't pick them up simultaneously.
+
+### Step 4.1: Launch Subagents
+
 For each issue in the current wave, launch parallel subagents:
 
 ```
@@ -128,7 +165,8 @@ Each agent receives:
 "Process issue #XX end-to-end:
 - Detect default branch: git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo 'main'
 - Create worktree ../fix-XX-<short-desc> from origin/<default-branch>
-- Read and understand the issue fully
+- Fetch the full issue including all comments: `gh issue view XX --json number,title,body,labels,comments`
+- Read the issue body AND all comments — comments often contain reproduction steps, clarifications, or constraints that are critical to the correct solution
 - Identify ROOT CAUSE (not surface-level symptoms — no z-index hacks, no retry loops without understanding why)
 - Write a failing test that reproduces the bug
 - Create a brief implementation plan
