@@ -86,19 +86,30 @@ For each issue, analyze for dependencies:
 
 ### Dependency Indicators
 
-1. **Explicit references:** Issue mentions `#<number>`, "depends on", "blocked by", "after #X"
-2. **Shared files:** Issues that likely touch the same files (based on description)
-3. **Sequential requirements:** "Step 2 of...", "Follow-up to..."
-4. **Feature dependencies:** Issue B needs feature from Issue A
+1. **Blocking references (creates dependency):** "depends on #X", "blocked by #X", "after #X", "requires #X", "follow-up to #X", "Step N of..."
+2. **Tracking references (NOT a dependency):** Umbrella/epic issues that list sub-issues (e.g. "Sub-tasks: #12, #15, #22" or "This epic tracks: #12, #15"). These are **trackers**, not blockers — the sub-issues are independent and can run in parallel.
+3. **Shared files:** Issues that likely touch the same files (based on description)
+4. **Feature dependencies:** Issue B needs a feature that Issue A introduces
+
+### CRITICAL: Umbrella/Epic Detection
+
+An issue is an **umbrella/epic** if:
+- Its title contains words like "Epic", "Umbrella", "Tracking", "Meta"
+- Its body uses checklist format listing multiple issues: `- [ ] #12`, `- [x] #15`
+- It describes itself as tracking progress across multiple issues
+
+**Umbrella issues do NOT block their sub-issues.** Sub-issues are independent. Place sub-issues in Wave 1 (or their appropriate wave based on their own dependencies), and the umbrella issue either:
+- Gets processed in parallel with the sub-issues (if it has its own implementation work), or
+- Is skipped/deferred if it has no independent work beyond tracking
 
 ### Analysis Process
 
 ```
 For each issue:
-  1. Read issue body for explicit issue references (#XX)
-  2. Extract mentioned files/components
-  3. Look for dependency keywords
-  4. Build dependency graph
+  1. Check if it's an umbrella/epic — if so, mark it and do NOT treat its referenced issues as dependents
+  2. Read issue body for BLOCKING dependency keywords (depends on, blocked by, after #X, requires #X)
+  3. Extract mentioned files/components
+  4. Build dependency graph using only blocking relationships
 ```
 
 ### Dependency Graph Output
@@ -127,13 +138,17 @@ Unclear (need manual review):
 Group independent issues into waves:
 
 ```
-Wave 1: [#12, #15, #22, #41] - 4 independent issues
+Wave 1: [#12, #15, #22, #41] - 4 independent issues (including sub-issues of any umbrella)
 Wave 2: [#18, #28, #33] - 3 issues (after wave 1 deps resolve)
 Wave 3: [#24, #32] - 2 issues (depend on wave 2)
 Wave 4: [#35] - 1 issue (depends on wave 3)
 
+Umbrella/Epic issues: [#10 - Epic: Dashboard] → placed in Wave 1 alongside sub-issues (or skipped if tracking-only)
+
 Total: 4 waves to process 10 issues
 ```
+
+**Umbrella placement rule:** Umbrella issues with their own implementation work go into Wave 1 as independent. Umbrella issues that are purely tracking (no code to write) can be skipped — they'll auto-close when sub-issues are linked and closed.
 
 **Present the wave plan to the user and wait for confirmation before proceeding.**
 
