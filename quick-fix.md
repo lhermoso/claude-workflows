@@ -9,7 +9,7 @@ description: Fast autonomous fix - minimal checkpoints, maximum automation
 ## Context
 
 Issue to fix:
-!`gh issue view $ARGUMENTS --json number,title,body,labels`
+!`gh issue view $ARGUMENTS --json number,title,body,labels,comments`
 
 Repository:
 !`git remote get-url origin`

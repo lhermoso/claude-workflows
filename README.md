@@ -208,7 +208,7 @@ Process multiple issues in parallel using subagents. Simple parallel execution w
 1. Gathers the issue list based on your filter
 2. Shows the list and waits for confirmation
 3. Launches parallel subagents (max 3) — each in its own worktree
-4. Each agent: understands issue → writes failing test → fixes → creates PR
+4. Each agent: fetches issue body + all comments → writes failing test → fixes → creates PR
 5. Aggregates results into a summary table
 6. Optionally batch-reviews all created PRs
 
@@ -229,6 +229,7 @@ Autonomous issue processor — analyzes dependencies between issues, batches ind
 /drain-issues --skip-review                         # create PRs without review (faster)
 /drain-issues --full-review                         # Claude↔Codex review loop per PR
 /drain-issues label:bug --full-review --no-merge    # combine flags
+/drain-issues --get-all                             # include issues assigned to others
 ```
 
 **Options:**
@@ -241,16 +242,18 @@ Autonomous issue processor — analyzes dependencies between issues, batches ind
 | `--no-merge` | `false` | Create and review PRs but don't auto-merge |
 | `--skip-review` | `false` | Create PRs without the review phase |
 | `--full-review` | `false` | Use Claude↔Codex review loop instead of basic review |
+| `--get-all` | `false` | Process all open issues regardless of assignment. By default, issues already assigned to someone else are skipped |
 
 **How it works:**
-1. Fetches all open issues (or filtered subset)
+1. Fetches all open issues (or filtered subset), skipping issues assigned to others (unless `--get-all`)
 2. Analyzes dependencies between issues (explicit `#ref`, shared files, sequential chains)
 3. Groups independent issues into waves
 4. Presents wave plan and waits for confirmation
-5. Processes each wave: parallel subagents in worktrees → PRs → review → merge
-6. Cleans up worktrees after each merge
-7. Moves to next wave until all issues are processed
-8. Final summary with merged PRs, failed items, and cleanup commands
+5. **Assigns itself** to all issues in the wave before starting work (claims them)
+6. Processes each wave: parallel subagents in worktrees → PRs → review → merge
+7. Cleans up worktrees after each merge
+8. Moves to next wave until all issues are processed
+9. Final summary with merged PRs, failed items, and cleanup commands
 
 **Wave example:**
 ```
@@ -352,6 +355,7 @@ Open Claude Code and type `/` — you should see the commands in autocomplete.
 ## Key design principles
 
 - **Git worktrees for isolation** — `/fix-issue`, `/quick-fix`, `/batch-issues`, and `/drain-issues` create worktrees so you can work on multiple issues in parallel without conflicts
+- **Full issue context** — Commands fetch the issue body *and all comments* before touching code. Reproduction steps, design decisions, and constraints often live in the thread, not the original description
 - **Root cause over surface fixes** — Commands explicitly warn against z-index hacks, retry loops, and other band-aids. They push for understanding *why* before fixing
 - **Test-driven fixes** — Write a failing test first, then implement the fix
 - **Conventional commits** — All commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) spec
