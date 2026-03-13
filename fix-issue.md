@@ -116,6 +116,15 @@ Thoroughly analyze issue #$ARGUMENTS:
 Use the EnterPlanMode tool to switch to plan mode before drafting your implementation plan.
 ```
 
+**Tool inventory for planning** — you cannot execute these now, but your plan MUST account for them. A plan that omits a "run tests" or "compile" step will produce an incomplete implementation. Available tools:
+- `Bash` → run shell commands (tests, linting, type checking, build/compile)
+- `Read`, `Grep`, `Glob` → explore and read codebase
+- `Edit`, `Write` → modify and create files
+- `gh` → GitHub CLI (create PRs, view issues, list labels)
+- `git` → version control operations
+
+Include explicit steps in your plan for: running the failing test, running the full test suite, running the linter/type checker. If you don't put them in the plan, you won't do them.
+
 In plan mode, present a clear implementation plan:
 
 ```
