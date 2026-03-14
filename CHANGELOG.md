@@ -9,6 +9,10 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
 
 ## [Unreleased]
 
+### Added
+
+- **`/drain-issues`**: `--plan-review` flag — optional Codex plan review loop before implementation; each subagent writes a plan, Codex critiques it (max 3 rounds), then implements the refined plan; catches design issues early before any code is written
+
 ## [1.2.0] - 2026-03-13
 
 ### Fixed
