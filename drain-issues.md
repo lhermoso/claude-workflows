@@ -1,7 +1,7 @@
 ---
 allowed-tools: Bash(git:*), Bash(gh:*), Task
-argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all]
-description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done
+argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all] [--plan-review]
+description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Use --plan-review for Codex plan refinement before implementation.
 ---
 
 # Autonomous Issue Drainer
@@ -28,6 +28,7 @@ Arguments: **$ARGUMENTS**
 | `--no-merge` | false | Review PRs but don't auto-merge |
 | `--skip-review` | false | Create PRs without review/merge |
 | `--full-review` | false | Use Claude↔Codex review loop instead of basic review. Codex reviews each PR, Claude fixes issues, repeat until approved (max 15 iterations per PR). Much more thorough but slower (~5-15 min per PR). |
+| `--plan-review` | false | Use Codex to review the implementation plan before coding begins. Each subagent writes a plan, Codex reviews it (max 3 rounds), then implements the refined plan. Catches design issues early. |
 | `--get-all` | false | Process all open issues regardless of who is assigned. Without this flag, issues already assigned to someone else are skipped. |
 
 ---
@@ -184,7 +185,8 @@ Each agent receives:
 - Read the issue body AND all comments — comments often contain reproduction steps, clarifications, or constraints that are critical to the correct solution
 - Identify ROOT CAUSE (not surface-level symptoms — no z-index hacks, no retry loops without understanding why)
 - Write a failing test that reproduces the bug
-- Create a brief implementation plan
+- Create a brief implementation plan (root cause, proposed solution, files to modify, risks & edge cases, testing strategy)
+  **If `--plan-review` was requested:** Run Plan Review Loop before implementing (see below)
 - Implement the fix/feature with minimal changes
 - Run tests (new test should pass, full suite should pass)
 - Update CHANGELOG.md if one exists (add entry under [Unreleased])
@@ -192,6 +194,40 @@ Each agent receives:
 - Create atomic commit (NO Co-Authored-By)
 - Create PR linked to issue (NO Claude attribution)
 - Self-review the changes
+
+PLAN REVIEW LOOP (only if --plan-review was requested):
+After writing your plan, before writing any code, run this loop (max 3 rounds: 1 original + 2 refinements):
+
+For each round:
+  PLAN_REVIEW_PROMPT='You are a senior engineer reviewing an implementation plan. Be critical and concise.
+
+ISSUE:
+<issue title and body>
+
+PROPOSED PLAN (round N):
+<the plan>
+
+Review for:
+1. Incorrect or incomplete root cause diagnosis
+2. Missing edge cases not addressed
+3. Files or components that should be modified but are not listed
+4. Overly complex approach when a simpler one exists
+5. Missing steps (migrations, cache invalidation, config changes, etc.)
+
+Respond with:
+- APPROVED — if the plan is solid and ready to implement
+- [ISSUE] <description> — for each problem found (be specific)
+
+Do not repeat issues already addressed in prior rounds.'
+
+  Run: codex exec \"$PLAN_REVIEW_PROMPT\" --full-auto --ephemeral --json 2>/dev/null
+  Parse the last agent_message from JSONL output.
+
+  If APPROVED and no [ISSUE] items → exit loop, proceed to implement.
+  If [ISSUE] items found → revise plan, increment round, repeat.
+  If round reaches 3 → proceed with current best plan regardless.
+
+After the loop, implement using the final refined plan.
 
 IMPORTANT - Return ONLY this minimal JSON (no other text):
 {\"issue\": XX, \"pr\": <number|null>, \"status\": \"success|failed\", \"error\": \"<short error if failed>\"}"
@@ -566,6 +602,12 @@ Run without --dry-run to process.
 # Full automation for bugs only
 /drain-issues label:bug --max-parallel=4
 
+# Codex reviews plans before implementation (catches design issues early)
+/drain-issues --plan-review
+
+# Plan review + full review (maximum quality: review plan, then review code)
+/drain-issues --plan-review --full-review
+
 # Thorough review with Claude↔Codex loop (slower but catches more)
 /drain-issues --full-review
 
@@ -574,4 +616,7 @@ Run without --dry-run to process.
 
 # Codex review without auto-merge (review only)
 /drain-issues --full-review --no-merge
+
+# Plan review for complex features only
+/drain-issues label:feature --plan-review
 ```
