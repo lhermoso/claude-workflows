@@ -1,7 +1,7 @@
 ---
 allowed-tools: Bash(git:*), Bash(gh:*), Task
 argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all] [--plan-review]
-description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Use --plan-review for Codex plan refinement before implementation.
+description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Use --plan-review for two-pass Codex plan refinement (diagnosis verification + fix-impact trace against real code) before implementation.
 ---
 
 # Autonomous Issue Drainer
@@ -28,7 +28,7 @@ Arguments: **$ARGUMENTS**
 | `--no-merge` | false | Review PRs but don't auto-merge |
 | `--skip-review` | false | Create PRs without review/merge |
 | `--full-review` | false | Use Claude↔Codex review loop instead of basic review. Codex reviews each PR, Claude fixes issues, repeat until approved (max 15 iterations per PR). Much more thorough but slower (~5-15 min per PR). |
-| `--plan-review` | false | Use Codex to review the implementation plan before coding begins. Each subagent writes a plan, Codex reviews it (max 3 rounds), then implements the refined plan. Catches design issues early. |
+| `--plan-review` | false | Two-pass Claude↔Codex plan refinement before coding. Pass A: Codex verifies diagnosis against real code (max 2 rounds). Pass B: Codex traces fix's side-effects through the codebase (max 3 rounds). Plan + review history committed to `.pair/` alongside the fix. Catches fix-breaks-something-else bugs that diagnosis-only review misses. |
 | `--get-all` | false | Process all open issues regardless of who is assigned. Without this flag, issues already assigned to someone else are skipped. |
 
 ---
@@ -185,7 +185,39 @@ Each agent receives:
 - Read the issue body AND all comments — comments often contain reproduction steps, clarifications, or constraints that are critical to the correct solution
 - Identify ROOT CAUSE (not surface-level symptoms — no z-index hacks, no retry loops without understanding why)
 - Write a failing test that reproduces the bug
-- Create a brief implementation plan (root cause, proposed solution, files to modify, risks & edge cases, testing strategy)
+- Create implementation plan in `.pair/PLAN.md` at worktree root. Use these EXACT sections — Codex review depends on this structure:
+
+  ```markdown
+  ## Diagnosis
+  - Root cause (mechanism, not symptom)
+  - Confirmed by: <file>:<line> references for each claim
+  - Observability traps (states that look healthy but aren't)
+
+  ## Proposed Fix
+  - High-level approach
+  - Why this and not <alternative-1>, <alternative-2>
+
+  ## Files & Line Numbers
+  - <path>:<line> — what changes, why
+
+  ## Side-Effects Trace
+  - For each modified function: who else calls it, what assumptions break
+  - For each new code path: what existing tests cover it, what doesn't
+  - For each shared mutable state touched: concurrency / dedup / cache invariants
+
+  ## Acceptance Criteria
+  - [ ] specific, measurable checkboxes
+
+  ## Test Plan
+  - Failing test to write first (path + assertion)
+  - Regression surface (which existing tests must still pass)
+
+  ## What I Am Most Likely Wrong About
+  - One paragraph naming the weakest assumption. Codex reviews this paragraph FIRST.
+  ```
+
+  The `Side-Effects Trace` section is non-negotiable — it catches "the fix breaks something else" bugs that diagnosis-only review misses.
+
   **If `--plan-review` was requested:** Run Plan Review Loop before implementing (see below)
 - Implement the fix/feature with minimal changes
 - Run tests (new test should pass, full suite should pass)
@@ -196,38 +228,103 @@ Each agent receives:
 - Self-review the changes
 
 PLAN REVIEW LOOP (only if --plan-review was requested):
-After writing your plan, before writing any code, run this loop (max 3 rounds: 1 original + 2 refinements):
 
-For each round:
-  PLAN_REVIEW_PROMPT='You are a senior engineer reviewing an implementation plan. Be critical and concise.
+Goal: replicate the Claude↔Codex pair-review pattern that produces sharpened plans (see polymarkets-weather#231 for reference). Plan is reviewed against the **actual code in the worktree**, not just plan-shape correctness.
+
+Run TWO distinct passes in sequence. Merging them dilutes both.
+
+**Bookkeeping (applies to both passes):**
+- All Codex invocations run from worktree root so codex reads real files.
+- Append every Codex output to `.pair/REVIEW.md` with a `## Round N — <pass-name>` header. Pass the file in subsequent prompts so Codex doesn't re-raise dismissed issues.
+- Always pipe prompts via stdin (large prompts as positional args silently hang per CLAUDE.md).
+- Capture stderr — empty stdout ≠ approval. Retry once on empty output. If second attempt also empty, log warning and proceed without plan-review for this issue.
+- Use: `codex exec --full-auto --ephemeral --json --sandbox read-only` (read-only sandbox signals review intent, faster).
+
+---
+
+**Pass A — Diagnosis verification (max 2 rounds)**
+
+Verify root cause is real before discussing any fix.
+
+  DIAG_PROMPT='You are reviewing the DIAGNOSIS section of an implementation plan against actual code in this repo.
 
 ISSUE:
-<issue title and body>
+<issue title + body + comments>
 
-PROPOSED PLAN (round N):
-<the plan>
+PLAN:
+<contents of .pair/PLAN.md>
 
-Review for:
-1. Incorrect or incomplete root cause diagnosis
-2. Missing edge cases not addressed
-3. Files or components that should be modified but are not listed
-4. Overly complex approach when a simpler one exists
-5. Missing steps (migrations, cache invalidation, config changes, etc.)
+YOUR TASK — diagnosis only, ignore the proposed fix:
+1. Read the "What I Am Most Likely Wrong About" paragraph first. Take it seriously.
+2. For EVERY <file>:<line> reference in the Diagnosis section, read the file and verify the claim.
+3. Identify symptoms misread as root cause.
+4. Identify observability traps the plan missed.
 
-Respond with:
-- APPROVED — if the plan is solid and ready to implement
-- [ISSUE] <description> — for each problem found (be specific)
+OUTPUT FORMAT (markdown):
+## Diagnosis — Confirmed
+- <claim> — verified at <file>:<line>
+## Diagnosis — Corrections
+- [WRONG] <claim> — actual mechanism is <X> at <file>:<line>
+## Diagnosis — Missing
+- <observability trap or co-existing failure> at <file>:<line>
+## Verdict
+DIAGNOSIS_CONFIRMED | DIAGNOSIS_NEEDS_REVISION
 
-Do not repeat issues already addressed in prior rounds.'
+Cite line numbers. If no issues after honest search, say so.'
 
-  Run: codex exec \"$PLAN_REVIEW_PROMPT\" --full-auto --ephemeral --json 2>/dev/null
-  Parse the last agent_message from JSONL output.
+  Pipe via stdin (same mechanics as before — PROMPT_FILE / OUT_FILE / ERR_FILE / retry-on-empty).
+  Append output to `.pair/REVIEW.md`.
 
-  If APPROVED and no [ISSUE] items → exit loop, proceed to implement.
-  If [ISSUE] items found → revise plan, increment round, repeat.
-  If round reaches 3 → proceed with current best plan regardless.
+  If `DIAGNOSIS_NEEDS_REVISION` → revise Diagnosis section of `.pair/PLAN.md`, re-run Pass A.
+  If `DIAGNOSIS_CONFIRMED` → proceed to Pass B.
 
-After the loop, implement using the final refined plan.
+---
+
+**Pass B — Fix-impact trace (max 3 rounds)**
+
+Diagnosis confirmed. Now check the proposed fix doesn't break something else.
+
+  FIX_PROMPT='Diagnosis was confirmed. Now review the PROPOSED FIX against the actual code.
+
+ISSUE:
+<issue title + body + comments>
+
+PLAN:
+<contents of .pair/PLAN.md>
+
+PRIOR REVIEW ROUNDS (do not re-raise issues already addressed or dismissed):
+<contents of .pair/REVIEW.md>
+
+YOUR TASK:
+1. For every function the plan modifies, find all call sites. What assumptions break for callers not listed in the plan?
+2. For every new code path, identify shared mutable state, dedup keys, cache entries, locks. Find asymmetries (set-membership check on read but not on write, or vice versa).
+3. For every helper the plan reuses, check whether that helper has guards/early-returns/retro-windows that would still block the fix.
+4. For every new code path, identify which existing tests cover it and which do not.
+5. Find at least one of: incorrect line reference, side-effect not in plan, helper/guard that still blocks the fix, dedup/cache asymmetry, missing lock around shared mutable state, lifecycle issue (detached task without supervision). If after honest search you find none, say so.
+
+OUTPUT FORMAT (markdown):
+## Fix — Confirmed
+- <element of fix> — traced, no side-effects found
+## Fix — Bugs Introduced
+- [BUG] <description> — at <file>:<line> — why it breaks: <X> — proposed correction: <one line>
+## Fix — Missing From Plan
+- <missing step / invariant / test> — at <file>:<line>
+## Sharper Alternative (optional)
+- 3-5 bullets if a materially simpler/safer approach exists, otherwise omit.
+## Verdict
+FIX_APPROVED | FIX_NEEDS_REVISION
+
+Cite line numbers. No vague "consider edge cases".'
+
+  Same stdin/retry/parse mechanics. Append to `.pair/REVIEW.md`.
+
+  If `FIX_APPROVED` and no [BUG] items → exit loop, proceed to implement.
+  If [BUG] items → revise Side-Effects Trace + Files sections of `.pair/PLAN.md`, increment round, repeat.
+  If round reaches 3 → proceed with current best plan, but log unresolved [BUG] items in the PR body under `## Unresolved Codex concerns`.
+
+---
+
+After both passes, implement using the final `.pair/PLAN.md`. Commit `.pair/PLAN.md` and `.pair/REVIEW.md` alongside the fix so the pair-session is part of the PR record.
 
 IMPORTANT - Return ONLY this minimal JSON (no other text):
 {\"issue\": XX, \"pr\": <number|null>, \"status\": \"success|failed\", \"error\": \"<short error if failed>\"}"

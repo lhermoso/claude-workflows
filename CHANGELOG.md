@@ -13,6 +13,10 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
 
 - **`/drain-issues`**: `--plan-review` flag — optional Codex plan review loop before implementation; each subagent writes a plan, Codex critiques it (max 3 rounds), then implements the refined plan; catches design issues early before any code is written
 
+### Changed
+
+- **`/issue-pipeline` + `/drain-issues`**: `--plan-review` is now a two-pass Claude↔Codex review against the **actual code** in the worktree. Pass A verifies diagnosis (max 2 rounds); Pass B traces the proposed fix's side-effects (max 3 rounds). Plans use a structured 7-section format (`.pair/PLAN.md`) including a **Side-Effects Trace** and a **What I Am Most Likely Wrong About** paragraph. Codex runs with `--sandbox read-only` and stdin-piped prompts, returns structured output (Confirmed / Bugs Introduced / Missing / Verdict), and review history accumulates in `.pair/REVIEW.md` across rounds so dismissed issues are not re-raised. Both `.pair/` files are committed alongside the fix. Unresolved `[BUG]` items at round limit surface in the PR body under `## Unresolved Codex concerns` — Fixes #9
+
 ## [1.2.0] - 2026-03-13
 
 ### Fixed
