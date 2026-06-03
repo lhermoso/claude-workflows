@@ -28,7 +28,7 @@ Arguments: **$ARGUMENTS**
 | `--no-merge` | false | Review PRs but don't auto-merge |
 | `--skip-review` | false | Create PRs without review/merge |
 | `--full-review` | false | Use Claude↔Codex review loop instead of basic review. Codex reviews each PR, Claude fixes issues, repeat until approved (max 15 iterations per PR). Much more thorough but slower (~5-15 min per PR). |
-| `--plan-review` | false | Two-pass Claude↔Codex plan refinement before coding. Pass A: Codex verifies diagnosis against real code (max 2 rounds). Pass B: Codex traces fix's side-effects through the codebase (max 3 rounds). Plan + review history committed to `.pair/` alongside the fix. Catches fix-breaks-something-else bugs that diagnosis-only review misses. |
+| `--plan-review` | false | Two-pass Claude↔Codex plan refinement before coding. Pass A: Codex verifies diagnosis against real code (max 2 rounds). Pass B: Codex traces fix's side-effects through the codebase (max 3 rounds). Plan + review history written to `.pair/` (gitignored, local to the worktree — never committed). Catches fix-breaks-something-else bugs that diagnosis-only review misses. |
 | `--get-all` | false | Process all open issues regardless of who is assigned. Without this flag, issues already assigned to someone else are skipped. |
 
 ---
@@ -324,7 +324,7 @@ Cite line numbers. No vague "consider edge cases".'
 
 ---
 
-After both passes, implement using the final `.pair/PLAN.md`. Commit `.pair/PLAN.md` and `.pair/REVIEW.md` alongside the fix so the pair-session is part of the PR record.
+After both passes, implement using the final `.pair/PLAN.md`. Do NOT commit `.pair/` — it is gitignored working-notes scratch and must stay local to the worktree. Never `git add -f` it. If the pair-session reasoning is worth preserving in the PR record, mirror a concise summary into the PR body instead.
 
 IMPORTANT - Return ONLY this minimal JSON (no other text):
 {\"issue\": XX, \"pr\": <number|null>, \"status\": \"success|failed\", \"error\": \"<short error if failed>\"}"

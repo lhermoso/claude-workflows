@@ -295,7 +295,7 @@ If round reaches 3 → proceed to implement with the current (best) plan, but lo
 
 ---
 
-After both passes, implement using the final `.pair/PLAN.md`. Commit `.pair/PLAN.md` and `.pair/REVIEW.md` alongside the fix so the pair-session is part of the PR record.
+After both passes, implement using the final `.pair/PLAN.md`. Do NOT commit `.pair/` — it is gitignored working-notes scratch and must stay local to the worktree. Never `git add -f` it. If the pair-session reasoning is worth preserving in the PR record, mirror a concise summary into the PR body instead.
 
 GUARDRAILS:
 - NEVER push directly to master/main

@@ -12,6 +12,7 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
 ### Added
 
 - **`/drain-issues`**: `--plan-review` flag — optional Codex plan review loop before implementation; each subagent writes a plan, Codex critiques it (max 3 rounds), then implements the refined plan; catches design issues early before any code is written
+- **Codex port**: Added [`skills/gh-workflow-suite`](skills/gh-workflow-suite), a Codex-native skill that ports the repo's Claude workflows to Codex skills and review primitives
 
 ### Changed
 
