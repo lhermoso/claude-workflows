@@ -238,7 +238,7 @@ Run TWO distinct passes in sequence. Merging them dilutes both.
 - Append every Codex output to `.pair/REVIEW.md` with a `## Round N — <pass-name>` header. Pass the file in subsequent prompts so Codex doesn't re-raise dismissed issues.
 - Always pipe prompts via stdin (large prompts as positional args silently hang per CLAUDE.md).
 - Capture stderr — empty stdout ≠ approval. Retry once on empty output. If second attempt also empty, log warning and proceed without plan-review for this issue.
-- Use: `codex exec --full-auto --ephemeral --json --sandbox read-only` (read-only sandbox signals review intent, faster).
+- Use: `printf '%s' "$PROMPT" | codex exec - -s read-only -a never --ephemeral --json` (read-only sandbox signals review intent, faster). Do NOT use `--full-auto` — it is an undocumented legacy alias that errors on the `review` subcommand; use the explicit `-s <mode> -a never` pair everywhere.
 
 ---
 
@@ -400,7 +400,7 @@ for each PR in [#45, #46, #47]:
        b. Execute the /full-review workflow inline:
           - Get PR info and checkout the branch
           - Initialize iteration history
-          - Run Codex review with `codex exec` (including iteration history context on rounds 2+)
+          - Run Codex review via `codex exec review - -s workspace-write -a never --ephemeral --json` with the prompt piped on stdin (including iteration history context on rounds 2+); do NOT use `--full-auto`
           - Use Codex's default model only; do not pass `--model` or `-c model=...`
           - Parse review for [P1]/[P2] issues
           - Fix issues, commit, push
