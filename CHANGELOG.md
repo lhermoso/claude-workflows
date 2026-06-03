@@ -20,7 +20,7 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
 
 ### Fixed
 
-- **`/issue-pipeline` + `/drain-issues`**: corrected broken Codex invocations — prompts are now piped via stdin (positional args silently hang on large prompts), `--full-auto` replaced with version-safe `-s <mode> -a never` (it errors on the `review` subcommand in codex-cli 0.136.0), and the `/issue-pipeline` full-review loop now uses `codex exec review -` without `--base` (which is mutually exclusive with a custom prompt), diffing in-prompt instead — Fixes #14
+- **`/full-review` + `/issue-pipeline` + `/drain-issues`**: corrected Codex invocations to flags that actually parse on codex-cli 0.136.0 — prompts piped via stdin (positional args silently hang); plain `codex exec` uses `-s <mode>` only (non-interactive auto-approves — `-a`/`--ask-for-approval` is a global flag and errors after `exec`); `codex exec review` uses only `--ephemeral --json --title` (it rejects `-s`, `-a`, and `--full-auto`, and runs read-only by default); the `/issue-pipeline` full-review loop uses `codex exec review -` without `--base` (mutually exclusive with a custom prompt), diffing in-prompt — Fixes #14, #16
 
 ## [1.2.0] - 2026-03-13
 

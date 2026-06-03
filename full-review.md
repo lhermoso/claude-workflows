@@ -113,7 +113,7 @@ Build the Codex review prompt. It includes the three review gates, scope guardra
 
 **IMPORTANT — command form.** `codex exec review --base <branch>` is **mutually exclusive with a custom PROMPT**. We need a custom prompt, so we use `codex exec review` *without* `--base` and instruct Codex in-prompt to diff `HEAD` against `origin/$BASE_BRANCH`.
 
-**IMPORTANT — flags.** Use `-s workspace-write -a never` (verified on codex-cli 0.136.0). Do **NOT** use `--full-auto` — it errors on the `review` subcommand. Use Codex's default model (no `--model` / no `-c model=...`).
+**IMPORTANT — flags (verified on codex-cli 0.136.0).** `codex exec review` accepts NEITHER `-s/--sandbox` NOR `-a/--ask-for-approval` NOR `--full-auto` — passing any of them errors (`unexpected argument '-s' found`). It runs read-only + non-interactive by default. Use only `--ephemeral --json --title`. Use Codex's default model (no `--model` / no `-c model=...`).
 
 **Prompt template (all iterations) — assemble into `$REVIEW_PROMPT`:**
 
@@ -209,7 +209,7 @@ CODEX_OUT=$(mktemp -t codex-review-out-XXXX.jsonl)
 CODEX_ERR=$(mktemp -t codex-review-err-XXXX.log)
 
 printf '%s' "$REVIEW_PROMPT" |
-  codex exec review - -s workspace-write -a never --ephemeral --json \
+  codex exec review - --ephemeral --json \
     --title "$PR_TITLE" \
     > "$CODEX_OUT" 2> "$CODEX_ERR"
 
@@ -345,7 +345,7 @@ Follow-up issues opened (if any):
 
 ## Important Notes
 
-- The review runs with `-s workspace-write` so Codex can read all project files (and the linked issue context baked into the prompt) for context. `-a never` skips approval prompts. `--full-auto` is **not** used — it errors on the `review` subcommand in codex-cli 0.136.0.
+- The `codex exec review` subcommand runs read-only + non-interactive by default, so it can read all project files (and the linked issue context baked into the prompt) without any sandbox/approval flags. It rejects `-s`, `-a`, and `--full-auto` — pass only `--ephemeral --json --title` (verified on codex-cli 0.136.0).
 - Tags: `[P1]` critical, `[P2]` major, `[P3]` minor — suffixed with `[AC]` (acceptance criteria) or `[SECURITY]` for those gates. Only `[P1]`/`[P2]` block approval.
 - The iteration history is passed to Codex each round so it knows what was fixed/dismissed. If Codex re-raises a *correctness* issue already dismissed, skip it. **Never** skip a re-raised `[AC]`/`[SECURITY]` issue on those grounds.
 - Approval is gated on the `VERDICT:` line AND zero open `[P1]`/`[P2]` across all three gates — not on fuzzy phrases like "looks good".
