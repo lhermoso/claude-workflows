@@ -98,7 +98,7 @@ Output a precise problem statement that includes:
 
 Be specific and technical. This will be passed directly to a coding agent."
 
-ENHANCED_PROBLEM=$(codex exec "$ENHANCE_PROMPT" --full-auto --ephemeral --json 2>/dev/null | python3 -c "
+ENHANCED_PROBLEM=$(printf '%s' "$ENHANCE_PROMPT" | codex exec - -s read-only -a never --ephemeral --json 2>/dev/null | python3 -c "
 import json, sys
 result = None
 for line in sys.stdin:
@@ -234,7 +234,7 @@ DIAGNOSIS_CONFIRMED | DIAGNOSIS_NEEDS_REVISION
 
 Be specific. Cite line numbers. If you find no issues after honest search, say so explicitly."
 
-printf '%s' "$DIAG_PROMPT" | codex exec - --full-auto --ephemeral --json --sandbox read-only 2> "$CODEX_ERR"
+printf '%s' "$DIAG_PROMPT" | codex exec - -s read-only -a never --ephemeral --json 2> "$CODEX_ERR"
 ```
 
 Parse last `item.completed` / `agent_message` from JSONL. Append to `.pair/REVIEW.md`.
@@ -284,7 +284,7 @@ FIX_APPROVED | FIX_NEEDS_REVISION
 
 Be specific. Cite line numbers. No vague 'consider edge cases'."
 
-printf '%s' "$FIX_PROMPT" | codex exec - --full-auto --ephemeral --json --sandbox read-only 2> "$CODEX_ERR"
+printf '%s' "$FIX_PROMPT" | codex exec - -s read-only -a never --ephemeral --json 2> "$CODEX_ERR"
 ```
 
 Parse last `agent_message`. Append to `.pair/REVIEW.md`.
@@ -347,8 +347,8 @@ Run the full Claude↔Codex review loop for this PR inline:
    a. Build Codex prompt:
       - Iteration 1: `review`
       - Iteration N>1: Include `ITERATION_HISTORY` with instructions to skip dismissed/fixed issues
-   b. Run Codex with the default model only: `codex exec "$REVIEW_PROMPT" --base "origin/$BASE_BRANCH" --title "..." --full-auto --ephemeral --json 2>/dev/null`
-      Do not pass `--model` or `-c model=...`.
+   b. Run Codex review with the default model only — pipe the prompt via stdin: `printf '%s' "$REVIEW_PROMPT" | codex exec review - -s workspace-write -a never --ephemeral --json --title "..." 2> "$CODEX_ERR"`
+      Omit `--base` (it is mutually exclusive with a custom prompt) — instruct Codex in-prompt to diff `HEAD` vs `origin/$BASE_BRANCH`. Do NOT use `--full-auto` (errors on the `review` subcommand). Do not pass `--model` or `-c model=...`. Capture stderr; empty stdout ≠ approval.
    c. Parse JSONL output for the last `agent_message` text
    d. If no [P1]/[P2] issues → **APPROVED**, break
    e. Fix [P1]/[P2] issues, commit, push
@@ -392,7 +392,7 @@ Write a prompt that:
 
 Be concrete. Don't suggest rewrites — suggest targeted improvements to the existing code."
 
-IMPROVEMENT_PROMPT=$(codex exec "$IMPROVE_PROMPT" --full-auto --ephemeral --json 2>/dev/null | python3 -c "
+IMPROVEMENT_PROMPT=$(printf '%s' "$IMPROVE_PROMPT" | codex exec - -s read-only -a never --ephemeral --json 2>/dev/null | python3 -c "
 import json, sys
 result = None
 for line in sys.stdin:
