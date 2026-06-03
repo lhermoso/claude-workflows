@@ -1,0 +1,4 @@
+interface:
+  display_name: "GH Workflow Suite"
+  short_description: "Ported GitHub workflows for Codex"
+  default_prompt: "Use $gh-workflow-suite to run the Codex-native equivalent of /fix-issue, /issue-pipeline, /review-pr, /review-changes, /scan-debt, or the other workflows in this repo."

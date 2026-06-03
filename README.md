@@ -4,6 +4,8 @@ A collection of slash commands for [Claude Code](https://docs.anthropic.com/en/d
 
 Drop these into `~/.claude/commands/` and get a complete CI-like pipeline inside your terminal.
 
+This repo now also includes a Codex-native port under [`skills/gh-workflow-suite`](skills/gh-workflow-suite), since the local Codex install on this machine does not expose a comparable slash-command directory.
+
 ## Quick overview
 
 | Command | Description |
@@ -362,6 +364,24 @@ cp path/to/claude-workflows/*.md .claude/commands/
 ### Verify installation
 
 Open Claude Code and type `/` — you should see the commands in autocomplete.
+
+## Codex Port
+
+The Codex equivalent in this repo is the [`gh-workflow-suite`](skills/gh-workflow-suite) skill.
+
+Use it with prompts such as:
+
+```text
+Use $gh-workflow-suite to run the /fix-issue flow for issue #42.
+Use $gh-workflow-suite to emulate /issue-pipeline for "add rate limiting" with --plan-review.
+Use $gh-workflow-suite to run /review-pr for PR #123.
+```
+
+Porting notes:
+
+- Codex uses a skill here instead of a slash-command directory.
+- Parallel workflows such as `/batch-issues` and `/drain-issues` only use sub-agents when the user explicitly asks for delegation or parallelism.
+- Review-heavy workflows use native `codex review` or `codex exec review` semantics instead of Claude-specific command frontmatter.
 
 ## Key design principles
 
