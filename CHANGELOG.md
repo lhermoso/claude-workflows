@@ -11,6 +11,12 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
 
 ### Added
 
+- **`/issue-pipeline` + `/drain-issues`**: **Plan-Adherence Verification** (Verification Phase / Phase 5.5) — after implementation, a Workflow fans out one verifier agent per plan claim (acceptance criteria, file changes, test plan, side-effect invariants) against the actual worktree code + PR diff; DIVERGED/MISSING findings are adversarially confirmed by two independent refuters; a reverse-trace agent maps diff hunks back to claims to surface **unplanned changes**. Output is an **Implementation Report** posted as a PR comment (✅ as planned · 🔀 diverged · ❌ missing · ➕ unplanned). Confirmed-missing AC/test claims trigger a fix-and-reverify cycle; in `/drain-issues`, PLAN_NOT_MET PRs are blocked from auto-merge. Falls back to issue acceptance criteria when no `.pair/PLAN.md` exists. Opt out with `--no-verify`
+
+### Changed
+
+- **`/issue-pipeline` + `/drain-issues`**: **all quality gates are now ON by default** — plan review (two-pass Claude↔Codex), plan-adherence verification, and the full Claude↔Codex review loop run without flags. New opt-out flags: `--no-plan-review`, `--no-verify`, `--basic-review` (fast diff review instead of the Codex loop). Legacy `--plan-review`/`--full-review` flags are accepted but redundant. Fix subagents now return their worktree path and must not remove worktrees before verification reads `.pair/PLAN.md`
+
 - **`/drain-issues`**: `--plan-review` flag — optional Codex plan review loop before implementation; each subagent writes a plan, Codex critiques it (max 3 rounds), then implements the refined plan; catches design issues early before any code is written
 - **Codex port**: Added [`skills/gh-workflow-suite`](skills/gh-workflow-suite), a Codex-native skill that ports the repo's Claude workflows to Codex skills and review primitives
 

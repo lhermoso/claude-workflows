@@ -1,7 +1,7 @@
 ---
-allowed-tools: Bash(git:*), Bash(gh:*), Task
-argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all] [--plan-review]
-description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Use --plan-review for two-pass Codex plan refinement (diagnosis verification + fix-impact trace against real code) before implementation.
+allowed-tools: Bash(git:*), Bash(gh:*), Task, Workflow
+argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all] [--no-plan-review] [--basic-review] [--no-verify]
+description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. ALL quality gates ON by default: two-pass Codex plan refinement before coding, plan-adherence verification (Workflow drift report) after coding, and the Claude↔Codex full-review loop before merge. Opt out with --no-plan-review / --no-verify / --basic-review.
 ---
 
 # Autonomous Issue Drainer
@@ -26,10 +26,13 @@ Arguments: **$ARGUMENTS**
 | `--max-parallel=N` | 2 | Max concurrent subagents (keep low to avoid context overflow) |
 | `--dry-run` | false | Analyze only, don't process |
 | `--no-merge` | false | Review PRs but don't auto-merge |
-| `--skip-review` | false | Create PRs without review/merge |
-| `--full-review` | false | Use Claude↔Codex review loop instead of basic review. Codex reviews each PR, Claude fixes issues, repeat until approved (max 15 iterations per PR). Much more thorough but slower (~5-15 min per PR). |
-| `--plan-review` | false | Two-pass Claude↔Codex plan refinement before coding. Pass A: Codex verifies diagnosis against real code (max 2 rounds). Pass B: Codex traces fix's side-effects through the codebase (max 3 rounds). Plan + review history written to `.pair/` (gitignored, local to the worktree — never committed). Catches fix-breaks-something-else bugs that diagnosis-only review misses. |
+| `--skip-review` | false | Skip Phase 6 review/merge entirely (PRs left open) |
+| `--basic-review` | false | Use fast basic diff review (~1-2 min per PR) instead of the DEFAULT Claude↔Codex review loop (Codex reviews each PR, Claude fixes issues, repeat until approved, max 15 iterations per PR, ~5-15 min). |
+| `--no-plan-review` | false | Skip the DEFAULT two-pass Claude↔Codex plan refinement before coding. Pass A: Codex verifies diagnosis against real code (max 2 rounds). Pass B: Codex traces fix's side-effects through the codebase (max 3 rounds). Plan + review history written to `.pair/` (gitignored, local to the worktree — never committed). Catches fix-breaks-something-else bugs that diagnosis-only review misses. |
+| `--no-verify` | false | Skip the DEFAULT Phase 5.5 plan-adherence verification: a Workflow fans out one verifier per plan claim, adversarially confirms divergences, reverse-traces unplanned diff changes, and posts an Implementation Report on each PR. PLAN_NOT_MET PRs are blocked from auto-merge. |
 | `--get-all` | false | Process all open issues regardless of who is assigned. Without this flag, issues already assigned to someone else are skipped. |
+
+The legacy `--plan-review` / `--full-review` flags are accepted but redundant — they are now the default behavior. Fastest escape hatch (roughly the old default): `--no-plan-review --no-verify --basic-review`.
 
 ---
 
@@ -218,7 +221,7 @@ Each agent receives:
 
   The `Side-Effects Trace` section is non-negotiable — it catches "the fix breaks something else" bugs that diagnosis-only review misses.
 
-  **If `--plan-review` was requested:** Run Plan Review Loop before implementing (see below)
+  **Plan review runs by DEFAULT:** Run Plan Review Loop before implementing (see below). Skip only if `--no-plan-review` was passed.
 - Implement the fix/feature with minimal changes
 - Run tests (new test should pass, full suite should pass)
 - Update CHANGELOG.md if one exists (add entry under [Unreleased])
@@ -227,7 +230,7 @@ Each agent receives:
 - Create PR linked to issue (NO Claude attribution)
 - Self-review the changes
 
-PLAN REVIEW LOOP (only if --plan-review was requested):
+PLAN REVIEW LOOP (default — skipped only if --no-plan-review was passed):
 
 Goal: replicate the Claude↔Codex pair-review pattern that produces sharpened plans (see polymarkets-weather#231 for reference). Plan is reviewed against the **actual code in the worktree**, not just plan-shape correctness.
 
@@ -326,8 +329,10 @@ Cite line numbers. No vague "consider edge cases".'
 
 After both passes, implement using the final `.pair/PLAN.md`. Do NOT commit `.pair/` — it is gitignored working-notes scratch and must stay local to the worktree. Never `git add -f` it. If the pair-session reasoning is worth preserving in the PR record, mirror a concise summary into the PR body instead.
 
+IMPORTANT - Do NOT remove your worktree when done — Phase 5.5 verification reads `.pair/PLAN.md` from it (gitignored, exists only there). Cleanup happens in the main loop after merge.
+
 IMPORTANT - Return ONLY this minimal JSON (no other text):
-{\"issue\": XX, \"pr\": <number|null>, \"status\": \"success|failed\", \"error\": \"<short error if failed>\"}"
+{\"issue\": XX, \"pr\": <number|null>, \"worktree\": \"<abs path>\", \"status\": \"success|failed\", \"error\": \"<short error if failed>\"}"
 ```
 
 ### Process in Sub-Batches (Context Safety)
@@ -373,16 +378,162 @@ Failed: #41 - Test failures in utils.test.ts
 
 ---
 
+## Phase 5.5: Plan-Adherence Verification (DEFAULT, runs in MAIN LOOP)
+
+Skip only if `--no-verify` was passed.
+
+This phase asks a different question than review: not "is the code good?" but **"is the code what the plan said we'd build?"** It runs once per wave, in the **main conversation** (NOT inside fix subagents — Task subagents must not nest Workflow calls), after PRs are created (Phase 5) and BEFORE review/merge (Phase 6).
+
+**CRITICAL: do not remove any worktree before this phase completes** — verifiers read `.pair/PLAN.md` from the worktrees (gitignored, exists only there).
+
+### Step 1 — Build the contract list (inline)
+
+For each successful PR in the wave (from the subagent JSON: issue, pr, worktree):
+1. Read `<worktree>/.pair/PLAN.md`.
+2. Parse it into discrete claims: Acceptance Criteria checkboxes (type `ac`), Files & Line Numbers entries (`file`), Test Plan items (`test`), Side-Effects Trace invariants (`side-effect`). Assign ids like `ac1`, `f1`, `t1`, `s1`.
+3. **Fallback:** if PLAN.md is missing or its ACs are generic boilerplate, use the issue's own acceptance criteria as the contract and note it in that PR's report header: `> Verified against issue acceptance criteria — no implementation plan existed.`
+
+### Step 2 — Run ONE verification workflow for the whole wave
+
+Call the **Workflow tool** with the script below, passing `args: { prs: [{ pr, issue, worktree, claims: [{id, type, text}] }, ...] }`. Claims are flattened across PRs so verification of one PR doesn't wait on another; adversarial confirm runs only on DIVERGED/MISSING findings; one reverse-trace agent per PR surfaces unplanned changes.
+
+```js
+export const meta = {
+  name: 'wave-plan-adherence',
+  description: 'Verify each wave PR against its PLAN.md and report drift',
+  phases: [
+    { title: 'Verify', detail: 'one agent per plan claim, all PRs flattened' },
+    { title: 'Confirm', detail: 'adversarial check on divergences only' },
+    { title: 'Trace', detail: 'one reverse-trace agent per PR' },
+  ],
+}
+const VERDICT = {
+  type: 'object',
+  properties: {
+    status: { type: 'string', enum: ['MATCHED', 'DIVERGED', 'MISSING', 'UNVERIFIABLE'] },
+    evidence: { type: 'string', description: 'file:line citations' },
+    divergence: { type: 'string', description: 'how the implementation differs (empty if MATCHED)' },
+  },
+  required: ['status', 'evidence'],
+}
+const REFUTE = {
+  type: 'object',
+  properties: { refuted: { type: 'boolean' }, reason: { type: 'string' } },
+  required: ['refuted', 'reason'],
+}
+const UNPLANNED = {
+  type: 'object',
+  properties: {
+    changes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { location: { type: 'string' }, description: { type: 'string' } },
+        required: ['location', 'description'],
+      },
+    },
+  },
+  required: ['changes'],
+}
+const flat = args.prs.flatMap(p =>
+  p.claims.map(c => ({ ...c, pr: p.pr, issue: p.issue, worktree: p.worktree })))
+
+const verified = await pipeline(flat,
+  c => agent(`Verify this implementation-plan claim against the ACTUAL code.
+
+CLAIM (${c.type}): ${c.text}
+
+Worktree with the implementation: ${c.worktree} — read the real files there.
+PR diff: run \`gh pr diff ${c.pr}\`.
+
+Classify as exactly one of:
+- MATCHED: implemented as the plan stated
+- DIVERGED: implemented, but differently than planned — describe exactly how in 'divergence'
+- MISSING: not implemented at all
+- UNVERIFIABLE: cannot be determined from the code
+
+Cite file:line evidence for whatever you conclude.`,
+    { label: `verify:pr${c.pr}:${c.id}`, phase: 'Verify', schema: VERDICT }),
+  (v, c) => (!v || v.status === 'MATCHED' || v.status === 'UNVERIFIABLE')
+    ? ({ claim: c, verdict: v, confirmed: true })
+    : parallel([1, 2].map(i => () =>
+        agent(`A verifier reviewed PR #${c.pr} (worktree: ${c.worktree}) and reported:
+
+CLAIM: ${c.text}
+FINDING: ${v.status} — ${v.divergence || v.evidence}
+
+Your job (independent perspective ${i}): try to REFUTE this finding. Read the actual code and prove the claim WAS implemented as planned. Set refuted=true only with file:line proof; if you cannot refute after honest search, set refuted=false.`,
+          { label: `confirm:pr${c.pr}:${c.id}`, phase: 'Confirm', schema: REFUTE })))
+        .then(votes => ({
+          claim: c, verdict: v,
+          confirmed: votes.filter(Boolean).filter(x => !x.refuted).length >= 1,
+        }))
+)
+
+const traces = await pipeline(args.prs,
+  p => agent(`Read the full diff of PR #${p.pr} (run \`gh pr diff ${p.pr}\`).
+
+PLAN CLAIMS:
+${p.claims.map(c => `- [${c.id}] ${c.text}`).join('\n')}
+
+For each diff hunk, map it to a claim id. Return ONLY the changes that map to NO claim — these are unplanned changes. Group mechanical noise (imports, formatting, lockfiles) into a single entry.`,
+    { label: `trace:pr${p.pr}`, phase: 'Trace', schema: UNPLANNED })
+    .then(u => ({ pr: p.pr, unplanned: u ? u.changes : [] }))
+)
+
+return { verified: verified.filter(Boolean), traces: traces.filter(Boolean) }
+```
+
+### Step 3 — Per-PR Implementation Report
+
+Group the workflow's return value by PR and post one report per PR (`gh pr comment <pr> --body "<report>"`):
+
+```markdown
+## Implementation Report — PR #<pr> (Issue #<n>)
+
+| # | Plan item | Status | Evidence |
+|---|-----------|--------|----------|
+| ac1 | <claim text> | ✅ as planned | src/retry.ts:42 |
+| f2  | <claim text> | 🔀 diverged | guard moved to middleware.ts:30 — <how/why> |
+| t1  | <claim text> | ❌ missing | no test reproduces the bug |
+
+**Unplanned changes (in diff, not in plan):**
+- utils.ts:88 — refactored `parseConfig` — <description>
+
+**Summary:** N as planned · N diverged · N missing · N unplanned
+```
+
+Status mapping: `MATCHED` → ✅ · confirmed `DIVERGED` → 🔀 · confirmed `MISSING` → ❌ · `UNVERIFIABLE` → ⚠️. A DIVERGED/MISSING finding the Confirm step refuted (`confirmed: false`) is reported as ✅.
+
+### Step 4 — Record per-PR verdict (gates Phase 6)
+
+- **PLAN_MET:** no confirmed ❌ on any `ac` or `test` claim.
+- **PLAN_NOT_MET:** at least one confirmed ❌ on an `ac` or `test` claim. Attempt ONE fix cycle: apply the missing piece in the worktree, commit, push, re-verify just the failed claims (re-run the workflow with only those claims). If still failing → the PR is **blocked from auto-merge** in Phase 6; leave it open with the report comment as the record and move on.
+
+```
+Wave 1 Verification Summary:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PR #45 (Issue #12): PLAN_MET      (5 ✅ · 1 🔀 · 0 ❌ · 1 ➕)
+PR #46 (Issue #15): PLAN_MET      (4 ✅ · 0 🔀 · 0 ❌ · 0 ➕)
+PR #47 (Issue #22): PLAN_NOT_MET  (3 ✅ · 1 🔀 · 1 ❌ · 2 ➕) → blocked from auto-merge
+```
+
+Carry each PR's 🔀 and ➕ items into its Phase 6 review prompt — they are the first things the reviewer should scrutinize.
+
+---
+
 ## Phase 6: Review & Auto-Merge (SEQUENTIAL)
 
 **CRITICAL: Review and merge each PR one at a time. Do NOT batch reviews.**
 
 ### Review Mode Selection
 
-There are two review modes. Select based on the `--full-review` flag:
+There are two review modes. **Full review is the DEFAULT.** Use basic only if `--basic-review` was passed:
 
-- **Default (basic review):** Uses `/review-changes` — Claude reviews the diff for breaking changes, regressions, missing changelog, etc. Fast (~1-2 min per PR).
-- **`--full-review` mode:** Uses the Claude↔Codex review loop — Codex reviews the PR, Claude fixes any [P1]/[P2] issues, repeat until Codex approves (max 15 iterations). Much more thorough but slower (~5-15 min per PR). Codex receives iteration history so it won't re-raise dismissed issues.
+- **Default (full review):** Uses the Claude↔Codex review loop — Codex reviews the PR, Claude fixes any [P1]/[P2] issues, repeat until Codex approves (max 15 iterations). Thorough (~5-15 min per PR). Codex receives iteration history so it won't re-raise dismissed issues.
+- **`--basic-review` mode:** Uses `/review-changes` — Claude reviews the diff for breaking changes, regressions, missing changelog, etc. Fast (~1-2 min per PR).
+
+**Verification gate (from Phase 5.5):** a PR marked PLAN_NOT_MET is NEVER auto-merged, regardless of review outcome — review it anyway (the findings are still useful), but leave it open with a comment pointing at the Implementation Report. Include each PR's 🔀 diverged and ➕ unplanned items in the review prompt.
 
 ### Review Loop
 
@@ -393,7 +544,7 @@ for each PR in [#45, #46, #47]:
 
   1. REVIEW the PR:
 
-     If --full-review mode:
+     If full review (default):
        Run the full Claude↔Codex review loop for this PR:
 
        a. Get the PR number
@@ -412,13 +563,20 @@ for each PR in [#45, #46, #47]:
        After the loop completes, the PR is either clean (Codex approved) or
        has been iterated to convergence.
 
-     If basic review mode (default):
+     If --basic-review mode:
        Run /review-changes
        This checks: changelog, debug code, secrets, breaking changes, regressions
 
   2. IMMEDIATELY after review:
 
-     If APPROVED (basic review passed, or Codex approved in full-review):
+     If the PR was marked PLAN_NOT_MET in Phase 5.5:
+       Do NOT merge, even if the review approved.
+       ```bash
+       gh pr comment <PR> --body "Review passed but plan-adherence verification found unmet acceptance criteria — see the Implementation Report above. Holding for manual decision."
+       ```
+       → Log: "PR #XX held: plan not met" and move to next PR
+
+     If APPROVED (Codex approved in full review, or basic review passed) AND PLAN_MET:
        ```bash
        # Leave a COMMENT review (can't self-approve on GitHub)
        gh pr review <PR> --comment --body "Review passed: no breaking changes, no debug code, tests pass, root cause addressed"
@@ -675,10 +833,10 @@ Run without --dry-run to process.
 ## Usage Examples
 
 ```bash
-# Process all open issues in waves (full automation)
+# Process all open issues with ALL quality gates (plan review, verification report, full review)
 /drain-issues
 
-# Only process bugs
+# Only process bugs (all gates still on)
 /drain-issues label:bug
 
 # Analyze dependencies without processing
@@ -687,33 +845,21 @@ Run without --dry-run to process.
 # Limit parallelism
 /drain-issues --max-parallel=2
 
-# Review PRs but merge manually
+# All gates, but merge manually
 /drain-issues --no-merge
 
-# Just create PRs, skip review (faster but less safe)
-/drain-issues --skip-review
+# Fast mode — roughly the old default behavior (no plan review, no report, basic diff review)
+/drain-issues --no-plan-review --no-verify --basic-review
 
-# Combine options
-/drain-issues label:enhancement --max-parallel=3 --dry-run
+# Fastest possible: PRs only, no gates at all
+/drain-issues --skip-review --no-plan-review --no-verify
 
-# Full automation for bugs only
-/drain-issues label:bug --max-parallel=4
+# Keep the Implementation Report but skip the slow Codex review loop
+/drain-issues --basic-review
 
-# Codex reviews plans before implementation (catches design issues early)
-/drain-issues --plan-review
+# Skip pre-coding plan review but still verify implementation against the plan
+/drain-issues --no-plan-review
 
-# Plan review + full review (maximum quality: review plan, then review code)
-/drain-issues --plan-review --full-review
-
-# Thorough review with Claude↔Codex loop (slower but catches more)
-/drain-issues --full-review
-
-# Full automation with Codex review for critical bugs
-/drain-issues label:bug --full-review
-
-# Codex review without auto-merge (review only)
-/drain-issues --full-review --no-merge
-
-# Plan review for complex features only
-/drain-issues label:feature --plan-review
+# Trust the report, skip post-hoc verification only
+/drain-issues --no-verify
 ```
