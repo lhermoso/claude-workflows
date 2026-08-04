@@ -1,7 +1,7 @@
 ---
-allowed-tools: Bash(git:*), Bash(gh:*), Task, Workflow
+allowed-tools: Bash(git:*), Bash(gh:*), Task
 argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all] [--no-plan-review] [--basic-review] [--no-verify]
-description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. ALL quality gates ON by default: two-pass Codex plan refinement before coding, plan-adherence verification (Workflow drift report) after coding, and the Claude↔Codex full-review loop before merge. Opt out with --no-plan-review / --no-verify / --basic-review.
+description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. ALL quality gates ON by default: two-pass Codex plan refinement before coding, plan-adherence verification (inline drift report) after coding, and the Claude↔Codex full-review loop before merge. Opt out with --no-plan-review / --no-verify / --basic-review.
 ---
 
 # Autonomous Issue Drainer
@@ -29,7 +29,7 @@ Arguments: **$ARGUMENTS**
 | `--skip-review` | false | Skip Phase 6 review/merge entirely (PRs left open) |
 | `--basic-review` | false | Use fast basic diff review (~1-2 min per PR) instead of the DEFAULT Claude↔Codex review loop (Codex reviews each PR, Claude fixes issues, repeat until approved, max 15 iterations per PR, ~5-15 min). |
 | `--no-plan-review` | false | Skip the DEFAULT two-pass Claude↔Codex plan refinement before coding. Pass A: Codex verifies diagnosis against real code (max 2 rounds). Pass B: Codex traces fix's side-effects through the codebase (max 3 rounds). Plan + review history written to `.pair/` (gitignored, local to the worktree — never committed). Catches fix-breaks-something-else bugs that diagnosis-only review misses. |
-| `--no-verify` | false | Skip the DEFAULT Phase 5.5 plan-adherence verification: a Workflow fans out one verifier per plan claim, adversarially confirms divergences, reverse-traces unplanned diff changes, and posts an Implementation Report on each PR. PLAN_NOT_MET PRs are blocked from auto-merge. |
+| `--no-verify` | false | Skip the DEFAULT Phase 5.5 plan-adherence verification: an inline pass checks each plan claim against the PR diff, reverse-traces unplanned changes, and posts an Implementation Report on each PR. PLAN_NOT_MET PRs are blocked from auto-merge. |
 | `--get-all` | false | Process all open issues regardless of who is assigned. Without this flag, issues already assigned to someone else are skipped. |
 
 The legacy `--plan-review` / `--full-review` flags are accepted but redundant — they are now the default behavior. Fastest escape hatch (roughly the old default): `--no-plan-review --no-verify --basic-review`.
@@ -382,7 +382,9 @@ Failed: #41 - Test failures in utils.test.ts
 
 Skip only if `--no-verify` was passed.
 
-This phase asks a different question than review: not "is the code good?" but **"is the code what the plan said we'd build?"** It runs once per wave, in the **main conversation** (NOT inside fix subagents — Task subagents must not nest Workflow calls), after PRs are created (Phase 5) and BEFORE review/merge (Phase 6).
+This phase asks a different question than review: not "is the code good?" but **"is the code what the plan said we'd build?"** It runs once per wave, **inline in the main conversation** — no subagents, no fan-out — after PRs are created (Phase 5) and BEFORE review/merge (Phase 6).
+
+**Cost rule: budget ONE `gh pr diff` per PR plus targeted file reads.** Do not spawn agents or workflows here, and do not re-review code quality — that is Phase 6's job.
 
 **CRITICAL: do not remove any worktree before this phase completes** — verifiers read `.pair/PLAN.md` from the worktrees (gitignored, exists only there).
 
@@ -393,100 +395,25 @@ For each successful PR in the wave (from the subagent JSON: issue, pr, worktree)
 2. Parse it into discrete claims: Acceptance Criteria checkboxes (type `ac`), Files & Line Numbers entries (`file`), Test Plan items (`test`), Side-Effects Trace invariants (`side-effect`). Assign ids like `ac1`, `f1`, `t1`, `s1`.
 3. **Fallback:** if PLAN.md is missing or its ACs are generic boilerplate, use the issue's own acceptance criteria as the contract and note it in that PR's report header: `> Verified against issue acceptance criteria — no implementation plan existed.`
 
-### Step 2 — Run ONE verification workflow for the whole wave
+### Step 2 — Verify each PR inline, one at a time
 
-Call the **Workflow tool** with the script below, passing `args: { prs: [{ pr, issue, worktree, claims: [{id, type, text}] }, ...] }`. Claims are flattened across PRs so verification of one PR doesn't wait on another; adversarial confirm runs only on DIVERGED/MISSING findings; one reverse-trace agent per PR surfaces unplanned changes.
+For each PR in the wave:
 
-```js
-export const meta = {
-  name: 'wave-plan-adherence',
-  description: 'Verify each wave PR against its PLAN.md and report drift',
-  phases: [
-    { title: 'Verify', detail: 'one agent per plan claim, all PRs flattened' },
-    { title: 'Confirm', detail: 'adversarial check on divergences only' },
-    { title: 'Trace', detail: 'one reverse-trace agent per PR' },
-  ],
-}
-const VERDICT = {
-  type: 'object',
-  properties: {
-    status: { type: 'string', enum: ['MATCHED', 'DIVERGED', 'MISSING', 'UNVERIFIABLE'] },
-    evidence: { type: 'string', description: 'file:line citations' },
-    divergence: { type: 'string', description: 'how the implementation differs (empty if MATCHED)' },
-  },
-  required: ['status', 'evidence'],
-}
-const REFUTE = {
-  type: 'object',
-  properties: { refuted: { type: 'boolean' }, reason: { type: 'string' } },
-  required: ['refuted', 'reason'],
-}
-const UNPLANNED = {
-  type: 'object',
-  properties: {
-    changes: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: { location: { type: 'string' }, description: { type: 'string' } },
-        required: ['location', 'description'],
-      },
-    },
-  },
-  required: ['changes'],
-}
-const flat = args.prs.flatMap(p =>
-  p.claims.map(c => ({ ...c, pr: p.pr, issue: p.issue, worktree: p.worktree })))
+1. Read its diff once: `gh pr diff <pr>`. That single read is the evidence base for every claim on that PR.
+2. Walk the claim list and classify each claim:
+   - **MATCHED** — implemented as the plan stated
+   - **DIVERGED** — implemented, but differently than planned; note exactly how
+   - **MISSING** — not implemented at all
+   - **UNVERIFIABLE** — cannot be determined from the code
+3. Cite `file:line` evidence. Only open a worktree file when the diff alone can't settle a claim — read the specific region, not the whole file.
+4. Before marking a claim DIVERGED or MISSING, re-check the diff for the change under a different name or location. A rename or a move is not a miss.
+5. Reverse-trace in the same pass: note any hunk that maps to no claim — those are the unplanned changes. Collapse mechanical noise (imports, formatting, lockfiles) into one line.
 
-const verified = await pipeline(flat,
-  c => agent(`Verify this implementation-plan claim against the ACTUAL code.
-
-CLAIM (${c.type}): ${c.text}
-
-Worktree with the implementation: ${c.worktree} — read the real files there.
-PR diff: run \`gh pr diff ${c.pr}\`.
-
-Classify as exactly one of:
-- MATCHED: implemented as the plan stated
-- DIVERGED: implemented, but differently than planned — describe exactly how in 'divergence'
-- MISSING: not implemented at all
-- UNVERIFIABLE: cannot be determined from the code
-
-Cite file:line evidence for whatever you conclude.`,
-    { label: `verify:pr${c.pr}:${c.id}`, phase: 'Verify', schema: VERDICT }),
-  (v, c) => (!v || v.status === 'MATCHED' || v.status === 'UNVERIFIABLE')
-    ? ({ claim: c, verdict: v, confirmed: true })
-    : parallel([1, 2].map(i => () =>
-        agent(`A verifier reviewed PR #${c.pr} (worktree: ${c.worktree}) and reported:
-
-CLAIM: ${c.text}
-FINDING: ${v.status} — ${v.divergence || v.evidence}
-
-Your job (independent perspective ${i}): try to REFUTE this finding. Read the actual code and prove the claim WAS implemented as planned. Set refuted=true only with file:line proof; if you cannot refute after honest search, set refuted=false.`,
-          { label: `confirm:pr${c.pr}:${c.id}`, phase: 'Confirm', schema: REFUTE })))
-        .then(votes => ({
-          claim: c, verdict: v,
-          confirmed: votes.filter(Boolean).filter(x => !x.refuted).length >= 1,
-        }))
-)
-
-const traces = await pipeline(args.prs,
-  p => agent(`Read the full diff of PR #${p.pr} (run \`gh pr diff ${p.pr}\`).
-
-PLAN CLAIMS:
-${p.claims.map(c => `- [${c.id}] ${c.text}`).join('\n')}
-
-For each diff hunk, map it to a claim id. Return ONLY the changes that map to NO claim — these are unplanned changes. Group mechanical noise (imports, formatting, lockfiles) into a single entry.`,
-    { label: `trace:pr${p.pr}`, phase: 'Trace', schema: UNPLANNED })
-    .then(u => ({ pr: p.pr, unplanned: u ? u.changes : [] }))
-)
-
-return { verified: verified.filter(Boolean), traces: traces.filter(Boolean) }
-```
+Then move to the next PR. Nothing here runs in parallel, and nothing spawns an agent.
 
 ### Step 3 — Per-PR Implementation Report
 
-Group the workflow's return value by PR and post one report per PR (`gh pr comment <pr> --body "<report>"`):
+Post one report per PR (`gh pr comment <pr> --body "<report>"`):
 
 ```markdown
 ## Implementation Report — PR #<pr> (Issue #<n>)
@@ -503,12 +430,12 @@ Group the workflow's return value by PR and post one report per PR (`gh pr comme
 **Summary:** N as planned · N diverged · N missing · N unplanned
 ```
 
-Status mapping: `MATCHED` → ✅ · confirmed `DIVERGED` → 🔀 · confirmed `MISSING` → ❌ · `UNVERIFIABLE` → ⚠️. A DIVERGED/MISSING finding the Confirm step refuted (`confirmed: false`) is reported as ✅.
+Status mapping: `MATCHED` → ✅ · `DIVERGED` → 🔀 · `MISSING` → ❌ · `UNVERIFIABLE` → ⚠️.
 
 ### Step 4 — Record per-PR verdict (gates Phase 6)
 
-- **PLAN_MET:** no confirmed ❌ on any `ac` or `test` claim.
-- **PLAN_NOT_MET:** at least one confirmed ❌ on an `ac` or `test` claim. Attempt ONE fix cycle: apply the missing piece in the worktree, commit, push, re-verify just the failed claims (re-run the workflow with only those claims). If still failing → the PR is **blocked from auto-merge** in Phase 6; leave it open with the report comment as the record and move on.
+- **PLAN_MET:** no ❌ on any `ac` or `test` claim.
+- **PLAN_NOT_MET:** at least one ❌ on an `ac` or `test` claim. Attempt ONE fix cycle: apply the missing piece in the worktree, commit, push, re-verify **only the failed claims**. If still failing → the PR is **blocked from auto-merge** in Phase 6; leave it open with the report comment as the record and move on.
 
 ```
 Wave 1 Verification Summary:

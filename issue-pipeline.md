@@ -1,7 +1,7 @@
 ---
-allowed-tools: Bash(git:*), Bash(gh:*), Bash(grep:*), Bash(find:*), Bash(cat:*), Bash(npm:*), Bash(cargo:*), Bash(pnpm:*), Task, Workflow
+allowed-tools: Bash(git:*), Bash(gh:*), Bash(grep:*), Bash(find:*), Bash(cat:*), Bash(npm:*), Bash(cargo:*), Bash(pnpm:*), Task
 argument-hint: <issue-description OR issue-number> [--no-plan-review] [--basic-review] [--no-verify]
-description: Full pipeline: create issue (if needed), plan-review it (Claude↔Codex two-pass), fix it, verify implementation against plan (Workflow drift report), create PR, full Claude↔Codex review. ALL quality gates ON by default — use --no-plan-review / --basic-review / --no-verify to opt out.
+description: Full pipeline: create issue (if needed), plan-review it (Claude↔Codex two-pass), fix it, verify implementation against plan (inline drift report), create PR, full Claude↔Codex review. ALL quality gates ON by default — use --no-plan-review / --basic-review / --no-verify to opt out.
 ---
 
 # Issue Pipeline - Automated Flow
@@ -32,7 +32,7 @@ Determine the mode:
 | Gate | Default | Opt-out flag |
 |------|---------|--------------|
 | Plan Review Loop (Codex two-pass, before coding) | ON | `--no-plan-review` |
-| Verification Phase (plan-adherence Workflow + Implementation Report) | ON | `--no-verify` |
+| Verification Phase (inline plan-adherence + Implementation Report) | ON | `--no-verify` |
 | Full Claude↔Codex review loop on the PR | ON | `--basic-review` (falls back to fast diff review) |
 
 The legacy `--plan-review` / `--full-review` flags are accepted but redundant — they are now the default behavior.
@@ -324,7 +324,9 @@ Work autonomously. Make reasonable decisions. Only ask if truly blocked."
 
 Runs after the Fix Phase, before the Review Phase. Skip only if `--no-verify` was passed.
 
-The review loop asks "is the code good?". This phase asks a different question: **"is the code what we said we'd build?"** It verifies the implementation claim-by-claim against `.pair/PLAN.md` using a fan-out Workflow, then produces an **Implementation Report**: what was implemented as planned, what diverged, what's missing, and what changed without being in the plan.
+The review loop asks "is the code good?". This phase asks a different question: **"is the code what we said we'd build?"** It verifies the implementation claim-by-claim against `.pair/PLAN.md` **inline, in the main conversation** — no subagents, no fan-out — then produces an **Implementation Report**: what was implemented as planned, what diverged, what's missing, and what changed without being in the plan.
+
+**Cost rule: this phase is ONE diff read plus targeted file reads.** Do not spawn agents, do not launch workflows, do not re-review the code for quality — that is the Review Phase's job.
 
 ### Step 1 — Gather the contract
 
@@ -340,100 +342,21 @@ Extract one claim per:
 - Test Plan item → type `test` (ids `t1`, ...)
 - Side-Effects Trace invariant → type `side-effect` (ids `s1`, ...)
 
-### Step 3 — Run the verification workflow
+### Step 3 — Verify inline against the diff
 
-Call the **Workflow tool** with the script below, passing `args: { worktree: "<abs path>", pr: <number>, claims: [{id, type, text}, ...] }`. Design notes: one verifier per claim; adversarial confirm runs ONLY on bad news (DIVERGED/MISSING) so the report doesn't cry wolf; one reverse-trace agent maps diff hunks back to claims to surface unplanned changes.
-
-```js
-export const meta = {
-  name: 'plan-adherence',
-  description: 'Verify implementation against PLAN.md claims and produce drift report',
-  phases: [
-    { title: 'Verify', detail: 'one agent per plan claim' },
-    { title: 'Confirm', detail: 'adversarial check on divergences only' },
-    { title: 'Trace', detail: 'map diff hunks back to claims' },
-  ],
-}
-const VERDICT = {
-  type: 'object',
-  properties: {
-    status: { type: 'string', enum: ['MATCHED', 'DIVERGED', 'MISSING', 'UNVERIFIABLE'] },
-    evidence: { type: 'string', description: 'file:line citations' },
-    divergence: { type: 'string', description: 'how the implementation differs from the claim (empty if MATCHED)' },
-  },
-  required: ['status', 'evidence'],
-}
-const REFUTE = {
-  type: 'object',
-  properties: { refuted: { type: 'boolean' }, reason: { type: 'string' } },
-  required: ['refuted', 'reason'],
-}
-const UNPLANNED = {
-  type: 'object',
-  properties: {
-    changes: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: { location: { type: 'string' }, description: { type: 'string' } },
-        required: ['location', 'description'],
-      },
-    },
-  },
-  required: ['changes'],
-}
-const { worktree, pr, claims } = args
-const claimList = claims.map(c => `- [${c.id}] (${c.type}) ${c.text}`).join('\n')
-
-const verified = await pipeline(claims,
-  c => agent(`Verify this implementation-plan claim against the ACTUAL code.
-
-CLAIM (${c.type}): ${c.text}
-
-Worktree with the implementation: ${worktree} — read the real files there.
-PR diff: run \`gh pr diff ${pr}\`.
-
-Classify as exactly one of:
-- MATCHED: implemented as the plan stated
-- DIVERGED: implemented, but differently than planned — describe exactly how in 'divergence'
-- MISSING: not implemented at all
-- UNVERIFIABLE: cannot be determined from the code
-
-Cite file:line evidence for whatever you conclude.`,
-    { label: `verify:${c.id}`, phase: 'Verify', schema: VERDICT }),
-  (v, c) => (!v || v.status === 'MATCHED' || v.status === 'UNVERIFIABLE')
-    ? ({ claim: c, verdict: v, confirmed: true })
-    : parallel([1, 2].map(i => () =>
-        agent(`A verifier reviewed PR #${pr} (worktree: ${worktree}) and reported:
-
-CLAIM: ${c.text}
-FINDING: ${v.status} — ${v.divergence || v.evidence}
-
-Your job (independent perspective ${i}): try to REFUTE this finding. Read the actual code and prove the claim WAS implemented as planned. Set refuted=true only with file:line proof; if you cannot refute after honest search, set refuted=false.`,
-          { label: `confirm:${c.id}`, phase: 'Confirm', schema: REFUTE })))
-        .then(votes => ({
-          claim: c, verdict: v,
-          confirmed: votes.filter(Boolean).filter(x => !x.refuted).length >= 1,
-        }))
-)
-
-const unplanned = await agent(`Read the full diff of PR #${pr} (run \`gh pr diff ${pr}\`).
-
-PLAN CLAIMS:
-${claimList}
-
-For each diff hunk, map it to a claim id. Return ONLY the changes that map to NO claim — these are unplanned changes. Group mechanical noise (imports, formatting, lockfiles) into a single entry.`,
-  { label: 'reverse-trace', phase: 'Trace', schema: UNPLANNED })
-
-return {
-  verified: verified.filter(Boolean),
-  unplanned: unplanned ? unplanned.changes : [],
-}
-```
+1. Read the diff once: `gh pr diff <pr>`. That single read is the evidence base for every claim.
+2. Walk the claim list top to bottom and classify each one:
+   - **MATCHED** — implemented as the plan stated
+   - **DIVERGED** — implemented, but differently than planned; note exactly how
+   - **MISSING** — not implemented at all
+   - **UNVERIFIABLE** — cannot be determined from the code
+3. Cite `file:line` evidence for each verdict. Only open a file from the worktree when the diff alone can't settle a claim (e.g. the claim is about behavior in unchanged surrounding code) — read the specific region, not the whole file.
+4. Before marking a claim DIVERGED or MISSING, re-check the diff for the change under a different name or location — a rename or a move is not a miss. That single re-check replaces the old adversarial confirm step.
+5. Reverse-trace in the same pass: as you read hunks, note any hunk that maps to no claim. Those are the unplanned changes. Collapse mechanical noise (imports, formatting, lockfiles) into one line.
 
 ### Step 4 — Render and post the Implementation Report
 
-From the workflow's return value, build:
+From your inline verdicts, build:
 
 ```markdown
 ## Implementation Report — PR #<pr> (Issue #<n>)
@@ -450,14 +373,14 @@ From the workflow's return value, build:
 **Summary:** N as planned · N diverged · N missing · N unplanned
 ```
 
-Status mapping: `MATCHED` → ✅ · confirmed `DIVERGED` → 🔀 · confirmed `MISSING` → ❌ · `UNVERIFIABLE` → ⚠️. A DIVERGED/MISSING finding that the Confirm step refuted (`confirmed: false`) is reported as ✅ — the verifier was wrong, note it briefly.
+Status mapping: `MATCHED` → ✅ · `DIVERGED` → 🔀 · `MISSING` → ❌ · `UNVERIFIABLE` → ⚠️.
 
 Post it on the PR: `gh pr comment <pr> --body "<report>"` — this is the durable record of plan-vs-reality.
 
 ### Step 5 — Decision
 
-- **Any confirmed ❌ on an `ac` or `test` claim** → the implementation does not meet its own contract. Fix it in the worktree (apply the missing piece, commit, push), then re-run Steps 3–4. Max 2 verify-fix cycles; after that, proceed but mark the final pipeline status **NEEDS ATTENTION** and leave the report as the record.
-- **Confirmed 🔀** → non-blocking. The divergence is documented; if the implementation took a *better* path than the plan, fine — the point is it's no longer silent.
+- **Any ❌ on an `ac` or `test` claim** → the implementation does not meet its own contract. Fix it in the worktree (apply the missing piece, commit, push), then re-verify **only the failed claims** (not the whole list). Max 2 verify-fix cycles; after that, proceed but mark the final pipeline status **NEEDS ATTENTION** and leave the report as the record.
+- **🔀** → non-blocking. The divergence is documented; if the implementation took a *better* path than the plan, fine — the point is it's no longer silent.
 - **➕ unplanned changes** → non-blocking, but they are exactly what the Review Phase should scrutinize first — carry them into the review prompt.
 
 ---
