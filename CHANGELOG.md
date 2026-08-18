@@ -11,11 +11,77 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
 
 ### Added
 
+- **Codex `gh-workflow-suite`**: added complete `full-review`, `issue-pipeline`,
+  and `drain-issues` skill references; a bounded no-shell reviewer gateway;
+  strict JSON review schema; and a conservative user-global installer that
+  replaces the flattened `/import` artifact with the full skill package. Claude
+  is preferred, with one fresh read-only Codex fallback whenever Claude cannot
+  produce a valid, conclusive review
 - **`/issue-pipeline` + `/drain-issues`**: **Plan-Adherence Verification** (Verification Phase / Phase 5.5) — after implementation, a Workflow fans out one verifier agent per plan claim (acceptance criteria, file changes, test plan, side-effect invariants) against the actual worktree code + PR diff; DIVERGED/MISSING findings are adversarially confirmed by two independent refuters; a reverse-trace agent maps diff hunks back to claims to surface **unplanned changes**. Output is an **Implementation Report** posted as a PR comment (✅ as planned · 🔀 diverged · ❌ missing · ➕ unplanned). Confirmed-missing AC/test claims trigger a fix-and-reverify cycle; in `/drain-issues`, PLAN_NOT_MET PRs are blocked from auto-merge. Falls back to issue acceptance criteria when no `.pair/PLAN.md` exists. Opt out with `--no-verify`
 
 ### Changed
 
-- **`/issue-pipeline` + `/drain-issues`**: **all quality gates are now ON by default** — plan review (two-pass Claude↔Codex), plan-adherence verification, and the full Claude↔Codex review loop run without flags. New opt-out flags: `--no-plan-review`, `--no-verify`, `--basic-review` (fast diff review instead of the Codex loop). Legacy `--plan-review`/`--full-review` flags are accepted but redundant. Fix subagents now return their worktree path and must not remove worktrees before verification reads `.pair/PLAN.md`
+- **`/drain-issues` + `/issue-pipeline` plan review is now a single Codex pass**: the
+  two-pass, multi-round loop (Pass A diagnosis, max 2 rounds → Pass B fix-impact, max 3
+  rounds, up to 5 Codex calls per issue) collapses into **one** Codex review covering
+  diagnosis *and* fix side-effects in a single prompt. Claude writes `.pair/PLAN.md`,
+  Codex reviews it once against the real code in the worktree, Claude absorbs the
+  findings into the plan (`[WRONG]` → Diagnosis, `[BUG]` → Side-Effects Trace + Files,
+  `Missing From Plan` → added, rejected items → `## Dismissed` + `unresolved[]`), then
+  coding starts. There is no re-review round, so the `DIAGNOSIS_CONFIRMED` /
+  `FIX_APPROVED` verdicts are gone — they only existed to gate the loop. The planner
+  JSON's `plan_review` field is now `reviewed|skipped|unavailable` (was
+  `confirmed|max_rounds|skipped|unavailable`), and a `plan_rejected` escalation has the
+  planner revise the plan directly instead of re-running Codex. Empty-Codex handling is
+  unchanged: retry once, then hand off the unreviewed plan as `unavailable`
+- **`/drain-issues` + `/issue-pipeline` context handoff**: the planner now writes a
+  `.pair/CONTEXT.md` brief — files read with the regions that matter, real signatures
+  with line numbers, entry points, repo conventions, exact test/lint commands, dead
+  ends already ruled out, and what it did *not* read — and the coder starts from that
+  instead of re-exploring. Coders are explicitly barred from broad grep/glob sweeps and
+  orientation reads; they open a file only to edit it, to cover a gap the brief flags,
+  or to correct the brief, and report shortfalls back via `brief_gaps` so the template
+  can be fixed once instead of paying the re-read every issue. The Phase 5.5 / Verification
+  reviewer and the full-review fix loop consult the same brief, and Codex `[P1]`/`[P2]`
+  fix lists must now be self-contained (file, region, and current code) so the coder never
+  re-reads to locate a site. `.pair/CONTEXT.md` is gitignored worktree-local scratch like
+  the rest of `.pair/`
+- **`/drain-issues` + `/issue-pipeline` model routing**: roles are now split across
+  models instead of running everything on the session model. Planning (root-cause
+  investigation, `.pair/PLAN.md`, running the Codex plan review) and reviewing
+  (plan-adherence verification + Implementation Report, Codex `[P1]`/`[P2]` triage,
+  basic diff review, improvement-pass triage, merge decision) run on
+  **claude-fable-5**, with a single automatic retry on **opus** if fable is
+  unavailable — never a downgrade to sonnet. All code — failing test,
+  implementation, lint/test runs, changelog, commits, PRs, and applied review
+  fixes — is written by **claude-sonnet-5**. Consequences: the monolithic fix
+  subagent is split into a planner agent and a coder agent (the coder returns
+  `plan_rejected` with evidence instead of silently redesigning; one planner
+  round-trip is allowed); reviewers emit fix lists but never edit files;
+  plan-adherence verification moves from the main loop into one sequential
+  reviewer agent per PR (still one `gh pr diff`, still no fan-out). Overridable
+  per run with `--plan-model=`, `--code-model=`, `--review-model=`. Codex is
+  untouched and still runs on its own default model
+- **Codex port**: inverted the pair workflow so Codex is the only writer and the
+  local Claude CLI is the preferred independent read-only reviewer. Confirmed
+  any failed, invalid, or inconclusive Claude review now selects a sticky fresh
+  ephemeral Codex reviewer for the rest of the workflow run; the fallback
+  remains fail-closed. Review results are bound to immutable head/base/merge-base SHAs,
+  with evidence, prompt, provider state, artifacts, and provider scratch kept
+  separate so fallback reviewers cannot ingest prior raw attempts, and all
+  mutations invalidate local, adherence, review, and CI gates. A durable gate
+  ledger prevents a resumed or crashed gate from invoking Codex more than once
+- **Codex review UX**: successful Claude-to-Codex fallback is now silent during
+  execution. Provider provenance remains in artifacts and appears once in the
+  final report; only failed or inconclusive fallback interrupts commentary
+- **Codex plan-review latency**: diagnosis and fix-impact gates now require
+  curated evidence, medium effort, and a five-minute timeout. The 15-minute
+  high-effort budget is reserved for final full PR review
+- **Codex review contract repair**: the gateway now appends its hidden semantic
+  invariants to every frozen provider prompt, including all mandatory security
+  categories. A completed invalid Codex fallback receives one validator-guided
+  repair generation inside the already-consumed fallback session
+- **`/issue-pipeline` + `/drain-issues`**: **all quality gates are now ON by default** — plan review (a single Codex pass), plan-adherence verification, and the full Claude↔Codex review loop run without flags. New opt-out flags: `--no-plan-review`, `--no-verify`, `--basic-review` (fast diff review instead of the Codex loop). Legacy `--plan-review`/`--full-review` flags are accepted but redundant. Fix subagents now return their worktree path and must not remove worktrees before verification reads `.pair/PLAN.md`
 
 - **`/drain-issues`**: `--plan-review` flag — optional Codex plan review loop before implementation; each subagent writes a plan, Codex critiques it (max 3 rounds), then implements the refined plan; catches design issues early before any code is written
 - **Codex port**: Added [`skills/gh-workflow-suite`](skills/gh-workflow-suite), a Codex-native skill that ports the repo's Claude workflows to Codex skills and review primitives

@@ -1,7 +1,7 @@
 ---
 allowed-tools: Bash(git:*), Bash(gh:*), Task
-argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all] [--no-plan-review] [--basic-review] [--no-verify]
-description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. ALL quality gates ON by default: two-pass Codex plan refinement before coding, plan-adherence verification (inline drift report) after coding, and the Claude↔Codex full-review loop before merge. Opt out with --no-plan-review / --no-verify / --basic-review.
+argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all] [--no-plan-review] [--basic-review] [--no-verify] [--plan-model=M] [--code-model=M] [--review-model=M]
+description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Plans and reviews run on claude-fable-5 (fallback opus), code is written by claude-sonnet-5. ALL quality gates ON by default: a single Codex plan review before coding, plan-adherence verification after coding, and the Claude↔Codex full-review loop before merge. Opt out with --no-plan-review / --no-verify / --basic-review.
 ---
 
 # Autonomous Issue Drainer
@@ -28,11 +28,33 @@ Arguments: **$ARGUMENTS**
 | `--no-merge` | false | Review PRs but don't auto-merge |
 | `--skip-review` | false | Skip Phase 6 review/merge entirely (PRs left open) |
 | `--basic-review` | false | Use fast basic diff review (~1-2 min per PR) instead of the DEFAULT Claude↔Codex review loop (Codex reviews each PR, Claude fixes issues, repeat until approved, max 15 iterations per PR, ~5-15 min). |
-| `--no-plan-review` | false | Skip the DEFAULT two-pass Claude↔Codex plan refinement before coding. Pass A: Codex verifies diagnosis against real code (max 2 rounds). Pass B: Codex traces fix's side-effects through the codebase (max 3 rounds). Plan + review history written to `.pair/` (gitignored, local to the worktree — never committed). Catches fix-breaks-something-else bugs that diagnosis-only review misses. |
+| `--no-plan-review` | false | Skip the DEFAULT single Codex plan review before coding. Claude writes the plan, Codex reviews it once against real code (diagnosis + fix side-effects), Claude absorbs the findings into the plan, then coding starts — no re-review round. Plan + review written to `.pair/` (gitignored, local to the worktree — never committed). |
 | `--no-verify` | false | Skip the DEFAULT Phase 5.5 plan-adherence verification: an inline pass checks each plan claim against the PR diff, reverse-traces unplanned changes, and posts an Implementation Report on each PR. PLAN_NOT_MET PRs are blocked from auto-merge. |
 | `--get-all` | false | Process all open issues regardless of who is assigned. Without this flag, issues already assigned to someone else are skipped. |
+| `--plan-model=M` | `fable` | Override the planner model (`fable\|opus\|sonnet\|haiku`). |
+| `--code-model=M` | `sonnet` | Override the coder model. |
+| `--review-model=M` | `fable` | Override the reviewer model. |
 
 The legacy `--plan-review` / `--full-review` flags are accepted but redundant — they are now the default behavior. Fastest escape hatch (roughly the old default): `--no-plan-review --no-verify --basic-review`.
+
+---
+
+## Model Routing (applies to every Claude-side agent in this command)
+
+| Role | Covers | Model | Fallback |
+|------|--------|-------|----------|
+| **Planner** | root-cause investigation, writing and revising `.pair/PLAN.md`, running the single Codex plan review and absorbing its findings | `fable` (claude-fable-5) | `opus` |
+| **Reviewer** | plan-adherence verification + Implementation Report, basic diff review, triaging Codex `[P1]`/`[P2]` findings, merge decisions | `fable` (claude-fable-5) | `opus` |
+| **Coder** | failing test, implementation, lint/test runs, CHANGELOG, commits, PR creation, applying fixes the reviewer decided to accept | `sonnet` (claude-sonnet-5) | — |
+
+Rules:
+
+1. **Every `Task` launch passes an explicit `model`.** Never inherit the session model — the routing above is the contract.
+2. **Fable fallback:** if a launch with `model: fable` fails because the model is unavailable/invalid/over quota, retry the *identical* launch once with `model: opus`, and log `⚠️ fable unavailable — <role> downgraded to opus`. Never fall back to `sonnet` for a planner or reviewer role: sonnet writes code, it does not plan or judge.
+3. **Coder agents never plan.** A coder receives a finished `.pair/PLAN.md` and implements it. If the coder believes the plan is wrong, it stops and returns `"status": "plan_rejected"` with the reason — the planner (fable) revises, then the coder resumes. Coders do not silently redesign.
+4. **Reviewers never write code.** A reviewer produces verdicts and a fix list; the fixes are applied by a coder agent (sonnet).
+5. **Codex is unchanged** — it stays the external adversarial reviewer on its own default model. Never pass `--model` / `-c model=...` to Codex.
+6. The dependency/wave analysis in Phases 2–3 is planning work; when it is non-trivial (>10 issues or ambiguous chains), delegate it to a planner agent (`fable`) instead of doing it in the main loop.
 
 ---
 
@@ -173,21 +195,22 @@ done
 
 This marks the issues as in-progress so other contributors (or other `/drain-issues` sessions) don't pick them up simultaneously.
 
-### Step 4.1: Launch Subagents
+### Step 4.1: Launch Planner Agents (model: `fable`, fallback `opus`)
 
-For each issue in the current wave, launch parallel subagents:
+For each issue in the current wave, launch a **planner** Task agent — parallel, respecting `--max-parallel`. Planners investigate and write the plan; they do **not** implement.
 
 ```
-Launch N parallel Task agents (respecting --max-parallel):
+Launch N parallel Task agents with model: "fable" (on failure retry once with model: "opus"):
 
-Each agent receives:
-"Process issue #XX end-to-end:
+Each planner receives:
+"Plan the fix for issue #XX. You are the PLANNER — do not implement anything, do not write production code, do not commit. Your deliverable is a reviewed plan.
+
 - Detect default branch: git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo 'main'
 - Create worktree ../fix-XX-<short-desc> from origin/<default-branch>
 - Fetch the full issue including all comments: `gh issue view XX --json number,title,body,labels,comments`
 - Read the issue body AND all comments — comments often contain reproduction steps, clarifications, or constraints that are critical to the correct solution
 - Identify ROOT CAUSE (not surface-level symptoms — no z-index hacks, no retry loops without understanding why)
-- Write a failing test that reproduces the bug
+- Specify the failing test that reproduces the bug (path + assertion) — the coder writes it, you specify it
 - Create implementation plan in `.pair/PLAN.md` at worktree root. Use these EXACT sections — Codex review depends on this structure:
 
   ```markdown
@@ -221,35 +244,55 @@ Each agent receives:
 
   The `Side-Effects Trace` section is non-negotiable — it catches "the fix breaks something else" bugs that diagnosis-only review misses.
 
-  **Plan review runs by DEFAULT:** Run Plan Review Loop before implementing (see below). Skip only if `--no-plan-review` was passed.
-- Implement the fix/feature with minimal changes
-- Run tests (new test should pass, full suite should pass)
-- Update CHANGELOG.md if one exists (add entry under [Unreleased])
-- Stage specific files (never use git add -A)
-- Create atomic commit (NO Co-Authored-By)
-- Create PR linked to issue (NO Claude attribution)
-- Self-review the changes
+  **Plan review runs by DEFAULT:** Run the single-pass Plan Review below before handing off. Skip only if `--no-plan-review` was passed.
 
-PLAN REVIEW LOOP (default — skipped only if --no-plan-review was passed):
+- Write a CONTEXT BRIEF to `.pair/CONTEXT.md` at worktree root. This is the handoff that stops the coder from re-reading everything you just read. Without it, every file you opened gets opened again from a cold context — the single largest source of duplicated tokens in this pipeline. Include:
 
-Goal: replicate the Claude↔Codex pair-review pattern that produces sharpened plans (see polymarkets-weather#231 for reference). Plan is reviewed against the **actual code in the worktree**, not just plan-shape correctness.
+  ```markdown
+  ## Files Read (and what matters in each)
+  - <path> — <what it does; the specific region that matters>: lines <a>-<b>
 
-Run TWO distinct passes in sequence. Merging them dilutes both.
+  ## Key Symbols
+  - <symbol> — <path>:<line> — real signature, and who calls it
 
-**Bookkeeping (applies to both passes):**
-- All Codex invocations run from worktree root so codex reads real files.
-- Append every Codex output to `.pair/REVIEW.md` with a `## Round N — <pass-name>` header. Pass the file in subsequent prompts so Codex doesn't re-raise dismissed issues.
-- Always pipe prompts via stdin (large prompts as positional args silently hang per CLAUDE.md).
-- Capture stderr — empty stdout ≠ approval. Retry once on empty output. If second attempt also empty, log warning and proceed without plan-review for this issue.
-- Use: `printf '%s' "$PROMPT" | codex exec - -s read-only --ephemeral --json` (read-only sandbox signals review intent, faster). `codex exec` is non-interactive and auto-approves within the sandbox — no `-a`/`--ask-for-approval` (that's a global flag and errors after `exec`) and no `--full-auto` (legacy alias; errors on `review`). The `codex exec review` subcommand takes neither `-s` nor `-a`.
+  ## Entry Points
+  - Where execution starts for the affected path, in call order
 
----
+  ## Conventions Observed
+  - Test framework, how tests are named and located here
+  - Error handling / logging / config idioms this repo actually uses
 
-**Pass A — Diagnosis verification (max 2 rounds)**
+  ## Commands
+  - Run tests: <exact command> · Run one test: <exact command>
+  - Lint/typecheck: <exact command> · Build (if needed): <exact command>
 
-Verify root cause is real before discussing any fix.
+  ## Dead Ends
+  - Files or approaches investigated and ruled out — so the coder doesn't repeat the search
 
-  DIAG_PROMPT='You are reviewing the DIAGNOSIS section of an implementation plan against actual code in this repo.
+  ## Not Yet Read
+  - Relevant things you did NOT open, so the coder knows the brief's edges
+  ```
+
+  Write it for an agent with ZERO prior context on this repo. Quote real signatures and line numbers instead of describing them — a vague brief just moves the re-exploration downstream and buys nothing.
+
+IMPORTANT — Do NOT implement, do NOT commit, do NOT open a PR. A separate coder agent does that from your plan.
+IMPORTANT — Do NOT remove the worktree. The coder and the verifier both need it.
+
+Return ONLY this minimal JSON (no other text):
+{\"issue\": XX, \"worktree\": \"<abs path>\", \"plan\": \"<abs path to .pair/PLAN.md>\", \"context_brief\": \"<abs path to .pair/CONTEXT.md>\", \"plan_review\": \"reviewed|skipped|unavailable\", \"unresolved\": [\"<short [BUG] item>\"], \"status\": \"success|failed\", \"error\": \"<short error if failed>\"}
+
+PLAN REVIEW (default — skipped only if --no-plan-review was passed):
+
+Goal: ONE adversarial Codex pass over the finished plan, checked against the **actual code in the worktree** — not just plan-shape correctness. Codex reviews once, you absorb the findings into `.pair/PLAN.md`, then the coder starts. There is NO re-review round: the revised plan is final.
+
+**Bookkeeping:**
+- Run Codex from the worktree root so it reads real files.
+- Write the Codex output to `.pair/REVIEW.md` under a `## Codex Plan Review` header.
+- Always pipe the prompt via stdin (large prompts as positional args silently hang per CLAUDE.md).
+- Capture stderr — empty stdout ≠ approval. Retry ONCE on empty output. If the second attempt is also empty, log a warning, set `plan_review: "unavailable"`, and hand the unreviewed plan to the coder.
+- Use: `printf '%s' "$PROMPT" | codex exec - -s read-only --ephemeral --json 2> "$CODEX_ERR"` (read-only sandbox signals review intent, faster). `codex exec` is non-interactive and auto-approves within the sandbox — no `-a`/`--ask-for-approval` (that's a global flag and errors after `exec`) and no `--full-auto` (legacy alias; errors on `review`).
+
+  REVIEW_PROMPT='You are reviewing an implementation plan against the actual code in this repo. Cover the diagnosis AND the proposed fix in this single pass — there will be no second round.
 
 ISSUE:
 <issue title + body + comments>
@@ -257,11 +300,20 @@ ISSUE:
 PLAN:
 <contents of .pair/PLAN.md>
 
-YOUR TASK — diagnosis only, ignore the proposed fix:
-1. Read the "What I Am Most Likely Wrong About" paragraph first. Take it seriously.
+YOUR TASK:
+
+A. DIAGNOSIS
+1. Read the "What I Am Most Likely Wrong About" paragraph FIRST. Take it seriously.
 2. For EVERY <file>:<line> reference in the Diagnosis section, read the file and verify the claim.
 3. Identify symptoms misread as root cause.
-4. Identify observability traps the plan missed.
+4. Identify observability traps the plan missed (states that look healthy but aren'"'"'t).
+
+B. FIX IMPACT
+5. For every function the plan modifies, find all call sites. What assumptions break for callers not listed in the plan?
+6. For every new code path, identify shared mutable state, dedup keys, cache entries, locks. Find asymmetries (set-membership check on read but not on write, or vice versa).
+7. For every helper the plan reuses, check whether that helper has guards/early-returns/retro-windows that would still block the fix.
+8. For every new code path, identify which existing tests cover it and which do not.
+9. Find at least one of: incorrect line reference, side-effect not in plan, helper/guard that still blocks the fix, dedup/cache asymmetry, missing lock around shared mutable state, lifecycle issue (detached task without supervision). If after honest search you find none, say so.
 
 OUTPUT FORMAT (markdown):
 ## Diagnosis — Confirmed
@@ -270,42 +322,6 @@ OUTPUT FORMAT (markdown):
 - [WRONG] <claim> — actual mechanism is <X> at <file>:<line>
 ## Diagnosis — Missing
 - <observability trap or co-existing failure> at <file>:<line>
-## Verdict
-DIAGNOSIS_CONFIRMED | DIAGNOSIS_NEEDS_REVISION
-
-Cite line numbers. If no issues after honest search, say so.'
-
-  Pipe via stdin (same mechanics as before — PROMPT_FILE / OUT_FILE / ERR_FILE / retry-on-empty).
-  Append output to `.pair/REVIEW.md`.
-
-  If `DIAGNOSIS_NEEDS_REVISION` → revise Diagnosis section of `.pair/PLAN.md`, re-run Pass A.
-  If `DIAGNOSIS_CONFIRMED` → proceed to Pass B.
-
----
-
-**Pass B — Fix-impact trace (max 3 rounds)**
-
-Diagnosis confirmed. Now check the proposed fix doesn't break something else.
-
-  FIX_PROMPT='Diagnosis was confirmed. Now review the PROPOSED FIX against the actual code.
-
-ISSUE:
-<issue title + body + comments>
-
-PLAN:
-<contents of .pair/PLAN.md>
-
-PRIOR REVIEW ROUNDS (do not re-raise issues already addressed or dismissed):
-<contents of .pair/REVIEW.md>
-
-YOUR TASK:
-1. For every function the plan modifies, find all call sites. What assumptions break for callers not listed in the plan?
-2. For every new code path, identify shared mutable state, dedup keys, cache entries, locks. Find asymmetries (set-membership check on read but not on write, or vice versa).
-3. For every helper the plan reuses, check whether that helper has guards/early-returns/retro-windows that would still block the fix.
-4. For every new code path, identify which existing tests cover it and which do not.
-5. Find at least one of: incorrect line reference, side-effect not in plan, helper/guard that still blocks the fix, dedup/cache asymmetry, missing lock around shared mutable state, lifecycle issue (detached task without supervision). If after honest search you find none, say so.
-
-OUTPUT FORMAT (markdown):
 ## Fix — Confirmed
 - <element of fix> — traced, no side-effects found
 ## Fix — Bugs Introduced
@@ -314,41 +330,75 @@ OUTPUT FORMAT (markdown):
 - <missing step / invariant / test> — at <file>:<line>
 ## Sharper Alternative (optional)
 - 3-5 bullets if a materially simpler/safer approach exists, otherwise omit.
-## Verdict
-FIX_APPROVED | FIX_NEEDS_REVISION
 
 Cite line numbers. No vague "consider edge cases".'
 
-  Same stdin/retry/parse mechanics. Append to `.pair/REVIEW.md`.
+---
 
-  If `FIX_APPROVED` and no [BUG] items → exit loop, proceed to implement.
-  If [BUG] items → revise Side-Effects Trace + Files sections of `.pair/PLAN.md`, increment round, repeat.
-  If round reaches 3 → proceed with current best plan, but log unresolved [BUG] items in the PR body under `## Unresolved Codex concerns`.
+**Absorb the review — you do this yourself, with NO second Codex call:**
+
+- Every `[WRONG]` item → rewrite the Diagnosis section of `.pair/PLAN.md`.
+- Every `[BUG]` item → rewrite the Side-Effects Trace and Files & Line Numbers sections.
+- Every `Fix — Missing From Plan` item → add that step / invariant / test to the plan.
+- A `Sharper Alternative` you accept → replace Proposed Fix, and record why under "Why this and not <alternative>".
+- Anything you deliberately reject → append a one-line reason to `.pair/REVIEW.md` under `## Dismissed`, and list it in `unresolved[]` so the coder records it in the PR body under `## Unresolved Codex concerns`.
+
+Do NOT re-run Codex on the revised plan. Set `plan_review: "reviewed"` and hand off.
 
 ---
 
-After both passes, implement using the final `.pair/PLAN.md`. Do NOT commit `.pair/` — it is gitignored working-notes scratch and must stay local to the worktree. Never `git add -f` it. If the pair-session reasoning is worth preserving in the PR record, mirror a concise summary into the PR body instead.
+After the review is absorbed, the plan is final. Do NOT commit `.pair/` — it is gitignored working-notes scratch and must stay local to the worktree. Never `git add -f` it. If the pair-session reasoning is worth preserving in the PR record, mirror a concise summary into the PR body instead. `.pair/CONTEXT.md` follows the same rule: local to the worktree, never committed, and never deleted before Phase 5.5 has run. Then return the planner JSON above."
+```
+
+### Step 4.2: Launch Coder Agents (model: `sonnet`)
+
+For each issue whose planner returned `"status": "success"`, launch a **coder** Task agent with `model: "sonnet"`. Coders run in the planner's worktree and implement the approved plan — nothing more.
+
+```
+Launch N parallel Task agents with model: "sonnet" (respecting --max-parallel):
+
+Each coder receives:
+"Implement issue #XX from an already-reviewed plan. You are the CODER — the plan is the contract. Do not re-plan, do not redesign.
+
+- Work in the existing worktree: <worktree path from planner JSON>
+- Read `.pair/CONTEXT.md` FIRST, then `.pair/PLAN.md`. The context brief is a complete handoff from the agent that already explored this repo: the files that matter, real signatures with line numbers, entry points, conventions, exact test/lint commands, and dead ends already ruled out.
+- **Do NOT re-explore the codebase.** No broad grep/glob sweeps, no reading files end-to-end to get oriented, no re-deriving what the brief already states — that work is already paid for. Open a file only when (a) you are editing it, (b) the brief lists it under `Not Yet Read` and you need it, or (c) the brief is demonstrably wrong about it — and then read the specific region, not the whole file. If the brief has a gap that blocks you, note it in `brief_gaps` in your return JSON so the planner's brief can be fixed; do not silently fall back to re-exploring.
+- `.pair/PLAN.md` has been reviewed against real code by an independent reviewer; treat its Diagnosis, Files & Line Numbers, and Side-Effects Trace as decided.
+- Unresolved concerns carried from plan review (must be handled or explicitly noted in the PR body): <unresolved[] from planner JSON, or 'none'>
+- Write the failing test named in the Test Plan FIRST, confirm it fails for the stated reason.
+- Implement the fix/feature with minimal changes, exactly as the plan specifies.
+- Run tests (new test passes, full suite passes) and the linter/type checker.
+- Update CHANGELOG.md if one exists (add entry under [Unreleased]).
+- Stage specific files (never `git add -A`). Never stage `.pair/`.
+- Create an atomic conventional commit: fix|feat(scope): description - Fixes #XX (NO Co-Authored-By, no Claude/Anthropic attribution).
+- Push and create a PR linked to the issue (no Claude attribution in the body). If there were unresolved plan-review concerns, list them under `## Unresolved Codex concerns`.
+
+ESCALATION: if implementing reveals the plan is wrong (root cause misidentified, the specified change is impossible or would break a caller the plan didn't consider), STOP. Do not improvise a different fix. Return status `plan_rejected` with the specific reason and the evidence (<file>:<line>). The main loop will send it back to the planner (fable) for revision and then relaunch you.
 
 IMPORTANT - Do NOT remove your worktree when done — Phase 5.5 verification reads `.pair/PLAN.md` from it (gitignored, exists only there). Cleanup happens in the main loop after merge.
 
 IMPORTANT - Return ONLY this minimal JSON (no other text):
-{\"issue\": XX, \"pr\": <number|null>, \"worktree\": \"<abs path>\", \"status\": \"success|failed\", \"error\": \"<short error if failed>\"}"
+{\"issue\": XX, \"pr\": <number|null>, \"worktree\": \"<abs path>\", \"status\": \"success|failed|plan_rejected\", \"brief_gaps\": [\"<what the context brief was missing or wrong about>\"], \"error\": \"<short error / rejection reason if not success>\"}"
 ```
+
+**On `brief_gaps`:** non-blocking, but log them in the wave summary. A recurring gap means the planner's `.pair/CONTEXT.md` template needs a section — fixing it once removes the duplicated reads permanently.
+
+**On `plan_rejected`:** relaunch the planner agent (`fable`) for that issue with the coder's rejection reason appended to the prompt, have it revise `.pair/PLAN.md` directly (no new Codex review), then relaunch the coder. Max 1 round-trip per issue; after that, mark the issue failed and move on.
 
 ### Process in Sub-Batches (Context Safety)
 
-If wave has 4+ issues, split into sub-batches of 2:
+If wave has 4+ issues, split into sub-batches of 2. Each sub-batch runs plan → code sequentially per issue, but the two issues in the sub-batch run in parallel:
 
 ```
 Wave 1 has 6 issues: [#12, #15, #22, #41, #28, #33]
 
-Sub-batch 1: Process #12, #15 in parallel
+Sub-batch 1: plan #12, #15 in parallel (fable) → code #12, #15 in parallel (sonnet)
   → Collect minimal results
 
-Sub-batch 2: Process #22, #41 in parallel
+Sub-batch 2: plan #22, #41 (fable) → code #22, #41 (sonnet)
   → Collect minimal results
 
-Sub-batch 3: Process #28, #33 in parallel
+Sub-batch 3: plan #28, #33 (fable) → code #28, #33 (sonnet)
   → Collect minimal results
 ```
 
@@ -382,38 +432,49 @@ Failed: #41 - Test failures in utils.test.ts
 
 Skip only if `--no-verify` was passed.
 
-This phase asks a different question than review: not "is the code good?" but **"is the code what the plan said we'd build?"** It runs once per wave, **inline in the main conversation** — no subagents, no fan-out — after PRs are created (Phase 5) and BEFORE review/merge (Phase 6).
+This phase asks a different question than review: not "is the code good?" but **"is the code what the plan said we'd build?"** It runs once per wave, after PRs are created (Phase 5) and BEFORE review/merge (Phase 6).
 
-**Cost rule: budget ONE `gh pr diff` per PR plus targeted file reads.** Do not spawn agents or workflows here, and do not re-review code quality — that is Phase 6's job.
+**Who runs it:** verification is reviewer work, so it runs in a **reviewer agent (`model: "fable"`, fallback `"opus"`)** — one agent per PR, launched **sequentially, one at a time**. This is not fan-out: exactly one agent per PR, no per-claim agents, no refuter agents, no Workflow. The main loop only collects each agent's JSON verdict.
+
+**Cost rule: budget ONE `gh pr diff` per PR plus targeted file reads.** Do not re-review code quality — that is Phase 6's job.
 
 **CRITICAL: do not remove any worktree before this phase completes** — verifiers read `.pair/PLAN.md` from the worktrees (gitignored, exists only there).
 
-### Step 1 — Build the contract list (inline)
+### Step 1 — Build the contract list (inside the reviewer agent)
 
-For each successful PR in the wave (from the subagent JSON: issue, pr, worktree):
+For each successful PR in the wave (from the coder JSON: issue, pr, worktree):
 1. Read `<worktree>/.pair/PLAN.md`.
 2. Parse it into discrete claims: Acceptance Criteria checkboxes (type `ac`), Files & Line Numbers entries (`file`), Test Plan items (`test`), Side-Effects Trace invariants (`side-effect`). Assign ids like `ac1`, `f1`, `t1`, `s1`.
 3. **Fallback:** if PLAN.md is missing or its ACs are generic boilerplate, use the issue's own acceptance criteria as the contract and note it in that PR's report header: `> Verified against issue acceptance criteria — no implementation plan existed.`
 
-### Step 2 — Verify each PR inline, one at a time
+### Step 2 — Verify each PR in a reviewer agent, one at a time
 
-For each PR in the wave:
+For each PR in the wave, launch ONE reviewer agent (`model: "fable"`, fallback `"opus"`) with the instructions below. Wait for it to return before launching the next PR's reviewer. The agent returns only:
 
-1. Read its diff once: `gh pr diff <pr>`. That single read is the evidence base for every claim on that PR.
+```json
+{"pr": 45, "issue": 12, "verdict": "PLAN_MET|PLAN_NOT_MET", "counts": {"matched": 5, "diverged": 1, "missing": 0, "unplanned": 1},
+ "failed_claims": [{"id": "t1", "text": "...", "why": "..."}],
+ "carry_to_review": ["<diverged/unplanned item worth scrutiny>"]}
+```
+
+Reviewer agent instructions:
+
+1. Read the diff once: `gh pr diff <pr>`. That single read is the evidence base for every claim on that PR.
 2. Walk the claim list and classify each claim:
    - **MATCHED** — implemented as the plan stated
    - **DIVERGED** — implemented, but differently than planned; note exactly how
    - **MISSING** — not implemented at all
    - **UNVERIFIABLE** — cannot be determined from the code
-3. Cite `file:line` evidence. Only open a worktree file when the diff alone can't settle a claim — read the specific region, not the whole file.
+3. Cite `file:line` evidence. Only open a worktree file when the diff alone can't settle a claim — and check `.pair/CONTEXT.md` first, since the planner's brief already records signatures, call sites, and conventions for the files that matter. When you do open a file, read the specific region, not the whole file.
 4. Before marking a claim DIVERGED or MISSING, re-check the diff for the change under a different name or location. A rename or a move is not a miss.
 5. Reverse-trace in the same pass: note any hunk that maps to no claim — those are the unplanned changes. Collapse mechanical noise (imports, formatting, lockfiles) into one line.
+6. Post the Implementation Report (Step 3) on the PR, then return the JSON verdict. Do NOT fix anything — the reviewer does not write code.
 
-Then move to the next PR. Nothing here runs in parallel, and nothing spawns an agent.
+Then move to the next PR. Reviewer agents never run in parallel with each other, and they never spawn sub-agents.
 
 ### Step 3 — Per-PR Implementation Report
 
-Post one report per PR (`gh pr comment <pr> --body "<report>"`):
+The reviewer agent posts one report per PR (`gh pr comment <pr> --body "<report>"`):
 
 ```markdown
 ## Implementation Report — PR #<pr> (Issue #<n>)
@@ -435,7 +496,7 @@ Status mapping: `MATCHED` → ✅ · `DIVERGED` → 🔀 · `MISSING` → ❌ ·
 ### Step 4 — Record per-PR verdict (gates Phase 6)
 
 - **PLAN_MET:** no ❌ on any `ac` or `test` claim.
-- **PLAN_NOT_MET:** at least one ❌ on an `ac` or `test` claim. Attempt ONE fix cycle: apply the missing piece in the worktree, commit, push, re-verify **only the failed claims**. If still failing → the PR is **blocked from auto-merge** in Phase 6; leave it open with the report comment as the record and move on.
+- **PLAN_NOT_MET:** at least one ❌ on an `ac` or `test` claim. Attempt ONE fix cycle, respecting role separation: relaunch a **coder agent (`sonnet`)** in that worktree with the reviewer's `failed_claims[]` and instructions to apply only the missing pieces, commit and push; then relaunch the **reviewer agent (`fable`)** to re-verify **only the failed claims** (not the whole list). If still failing → the PR is **blocked from auto-merge** in Phase 6; leave it open with the report comment as the record and move on.
 
 ```
 Wave 1 Verification Summary:
@@ -457,8 +518,8 @@ Carry each PR's 🔀 and ➕ items into its Phase 6 review prompt — they are t
 
 There are two review modes. **Full review is the DEFAULT.** Use basic only if `--basic-review` was passed:
 
-- **Default (full review):** Uses the Claude↔Codex review loop — Codex reviews the PR, Claude fixes any [P1]/[P2] issues, repeat until Codex approves (max 15 iterations). Thorough (~5-15 min per PR). Codex receives iteration history so it won't re-raise dismissed issues.
-- **`--basic-review` mode:** Uses `/review-changes` — Claude reviews the diff for breaking changes, regressions, missing changelog, etc. Fast (~1-2 min per PR).
+- **Default (full review):** Uses the Claude↔Codex review loop — Codex reviews the PR, a **reviewer agent (`fable`)** triages the findings, a **coder agent (`sonnet`)** applies the accepted fixes, repeat until Codex approves (max 15 iterations). Thorough (~5-15 min per PR). Codex receives iteration history so it won't re-raise dismissed issues.
+- **`--basic-review` mode:** A **reviewer agent (`fable`)** reviews the diff for breaking changes, regressions, missing changelog, etc. Fast (~1-2 min per PR). Any fixes it asks for are applied by a coder agent (`sonnet`).
 
 **Verification gate (from Phase 5.5):** a PR marked PLAN_NOT_MET is NEVER auto-merged, regardless of review outcome — review it anyway (the findings are still useful), but leave it open with a comment pointing at the Implementation Report. Include each PR's 🔀 diverged and ➕ unplanned items in the review prompt.
 
@@ -475,24 +536,32 @@ for each PR in [#45, #46, #47]:
        Run the full Claude↔Codex review loop for this PR:
 
        a. Get the PR number
-       b. Execute the /full-review workflow inline:
+       b. Execute the /full-review workflow inline, with roles split by model:
           - Get PR info and checkout the branch
           - Initialize iteration history
           - Run Codex review via `codex exec review - --ephemeral --json` with the prompt piped on stdin (including iteration history context on rounds 2+); do NOT use `--full-auto`
           - Use Codex's default model only; do not pass `--model` or `-c model=...`
-          - Parse review for [P1]/[P2] issues
-          - Fix issues, commit, push
-          - Update iteration history with outcomes (FIXED/DISMISSED)
+          - REVIEWER agent (model: "fable", fallback "opus"): parse the review, triage each [P1]/[P2]
+            into ACCEPT (real, must fix) or DISMISS (with reason), and emit a precise fix list
+            (<file>:<line> — what to change — why). It does not edit files.
+            The fix list must be SELF-CONTAINED: exact file, exact line/region, and the current
+            code being changed — so the coder can act without re-reading to locate the site.
+          - CODER agent (model: "sonnet"): apply exactly the ACCEPTed fixes, run tests, commit, push.
+            Works from the fix list plus `.pair/CONTEXT.md`; does not re-explore the codebase.
+            If a fix cannot be applied as specified, it returns the reason instead of improvising.
+          - Update iteration history with outcomes (FIXED/DISMISSED) plus the dismissal reasons
           - Repeat until Codex approves or 15 iterations
+
        c. Record the final result (approved / max iterations reached)
 
-       NOTE: The /full-review loop handles its own fix-commit-push cycle.
-       After the loop completes, the PR is either clean (Codex approved) or
-       has been iterated to convergence.
+       NOTE: the loop's fix-commit-push cycle is done by the sonnet coder; the
+       accept/dismiss judgement is always fable's. After the loop completes, the PR is
+       either clean (Codex approved) or has been iterated to convergence.
 
      If --basic-review mode:
-       Run /review-changes
+       Launch a reviewer agent (model: "fable", fallback "opus") running /review-changes
        This checks: changelog, debug code, secrets, breaking changes, regressions
+       Any required fix is applied by a coder agent (model: "sonnet")
 
   2. IMMEDIATELY after review:
 
@@ -789,4 +858,13 @@ Run without --dry-run to process.
 
 # Trust the report, skip post-hoc verification only
 /drain-issues --no-verify
+
+# Model routing (defaults): plans + reviews on fable (fallback opus), code on sonnet
+/drain-issues
+
+# Force everything onto opus (e.g. fable is degraded)
+/drain-issues --plan-model=opus --review-model=opus
+
+# Cheaper planning, keep review quality
+/drain-issues --plan-model=sonnet
 ```

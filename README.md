@@ -4,7 +4,9 @@ A collection of slash commands for [Claude Code](https://docs.anthropic.com/en/d
 
 Drop these into `~/.claude/commands/` and get a complete CI-like pipeline inside your terminal.
 
-This repo now also includes a Codex-native port under [`skills/gh-workflow-suite`](skills/gh-workflow-suite), since the local Codex install on this machine does not expose a comparable slash-command directory.
+This repo also includes a user-global Codex skill source under
+[`skills/gh-workflow-suite`](skills/gh-workflow-suite). Install it with the
+bundled installer to use the workflows from any repository.
 
 ## Quick overview
 
@@ -245,6 +247,11 @@ Autonomous issue processor — analyzes dependencies between issues, batches ind
 | `--skip-review` | `false` | Create PRs without the review phase |
 | `--full-review` | `false` | Use Claude↔Codex review loop instead of basic review |
 | `--get-all` | `false` | Process all open issues regardless of assignment. By default, issues already assigned to someone else are skipped |
+| `--plan-model=M` | `fable` | Model for planner agents (`fable\|opus\|sonnet\|haiku`) |
+| `--code-model=M` | `sonnet` | Model for coder agents |
+| `--review-model=M` | `fable` | Model for reviewer agents |
+
+**Model routing:** planning (root cause, `.pair/PLAN.md`, the single Codex plan review) and reviewing (plan-adherence verification, Codex finding triage, merge decision) run on **claude-fable-5**, falling back to **opus** if fable is unavailable. Code — tests, implementation, review fixes, commits, PRs — is written by **claude-sonnet-5**. A planner never implements and a reviewer never edits files; fixes always go back through a coder agent.
 
 **How it works:**
 1. Fetches all open issues (or filtered subset), skipping issues assigned to others (unless `--get-all`)
@@ -252,7 +259,7 @@ Autonomous issue processor — analyzes dependencies between issues, batches ind
 3. Groups independent issues into waves
 4. Presents wave plan and waits for confirmation
 5. **Assigns itself** to all issues in the wave before starting work (claims them)
-6. Processes each wave: parallel subagents in worktrees → PRs → review → merge
+6. Processes each wave: planner agents (fable) write reviewed plans in worktrees → coder agents (sonnet) implement and open PRs → reviewer agents (fable) verify and triage → merge
 7. Cleans up worktrees after each merge
 8. Moves to next wave until all issues are processed
 9. Final summary with merged PRs, failed items, and cleanup commands
@@ -300,17 +307,22 @@ Full pipeline: create an issue (if needed), fix it, create a PR, and self-review
 
 | Flag | Description |
 |------|-------------|
-| `--plan-review` | Claude↔Codex plan refinement loop before implementation (up to 3 rounds) |
+| `--plan-review` | Redundant — one Codex plan review before implementation is the default (disable with `--no-plan-review`) |
 | `--full-review` | Claude↔Codex iterative review loop after implementation |
+| `--plan-model=M` | Model for the planner agent (default `fable`, fallback `opus`) |
+| `--code-model=M` | Model for the coder agent (default `sonnet`) |
+| `--review-model=M` | Model for reviewer agents (default `fable`, fallback `opus`) |
+
+**Model routing:** the plan and every review run on **claude-fable-5** (fallback **opus**); the code is written by **claude-sonnet-5**. Planner, coder, and reviewer are separate agents — the coder cannot silently redesign the plan (it must return `plan_rejected` instead), and the reviewer cannot edit files.
 
 **How it works:**
 1. **Detects mode:** number → fix existing issue; text → create new issue first
 2. **Creates issue** (if text input): auto-detects type from keywords (bug/feature/enhancement)
 3. **Sharpens the problem statement:** Codex pre-analyzes the issue and produces a precise problem statement (root cause hypothesis, affected files, edge cases, success criteria)
-4. **Spawns a subagent** that: creates worktree → investigates root cause → writes failing test → creates implementation plan
-5. **Plan review loop** (`--plan-review`): Codex reviews the plan and flags issues → Claude refines → repeat up to 3 rounds → implement with the best plan
-6. **Implements** the fix with minimal changes → runs tests + linter → updates changelog → commits → creates PR
-7. **Reviews the PR:** basic review (default) or Claude↔Codex loop (`--full-review`)
+4. **Planner agent (fable)**: creates worktree → investigates root cause → specifies the failing test → writes `.pair/PLAN.md`
+5. **Plan review** (default; `--no-plan-review` to skip): Codex reviews the plan **once** against the real code — diagnosis and fix side-effects in one pass → the planner absorbs the findings into `.pair/PLAN.md` → hand off. No re-review round
+6. **Coder agent (sonnet)**: writes the failing test → implements with minimal changes → runs tests + linter → updates changelog → commits → creates PR
+7. **Reviewer agent (fable):** plan-adherence Implementation Report, then basic review (default) or Claude↔Codex loop (`--full-review`) — accepted fixes go back to a coder agent
 8. **Improvement passes:** up to 2 Codex-powered quality passes on the finished implementation (better abstractions, naming, edge cases)
 9. **Merges if safe**, or reports what needs attention
 
@@ -367,27 +379,65 @@ Open Claude Code and type `/` — you should see the commands in autocomplete.
 
 ## Codex Port
 
-The Codex equivalent in this repo is the [`gh-workflow-suite`](skills/gh-workflow-suite) skill.
+The Codex equivalent is the complete [`gh-workflow-suite`](skills/gh-workflow-suite)
+skill. Codex plans, edits, tests, commits, pushes, and manages GitHub; a fresh
+read-only `claude -p` process preferably reviews plans and PR snapshots. If
+Claude cannot produce a valid, conclusive review, the gateway automatically uses
+one fresh ephemeral Codex CLI reviewer in a read-only sandbox instead.
+
+Install it once for every repository on the current machine:
+
+```bash
+python3 skills/gh-workflow-suite/scripts/install_user_skill.py
+```
+
+The installer links the complete skill into `~/.agents/skills`, including its
+references, JSON schema, and fallback-aware review gateway. It also moves the
+broken flattened `/import` artifact outside the scanned skill directory when present.
+Start a new Codex task or restart Codex after installation.
 
 Use it with prompts such as:
 
 ```text
-Use $gh-workflow-suite to run the /fix-issue flow for issue #42.
-Use $gh-workflow-suite to emulate /issue-pipeline for "add rate limiting" with --plan-review.
-Use $gh-workflow-suite to run /review-pr for PR #123.
+Use $gh-workflow-suite to run full-review for PR #123.
+Use $gh-workflow-suite to run issue-pipeline for issue #42.
+Use $gh-workflow-suite to run issue-pipeline for "add rate limiting".
+Use $gh-workflow-suite to run drain-issues label:bug --max-parallel=2.
 ```
 
 Porting notes:
 
-- Codex uses a skill here instead of a slash-command directory.
-- Parallel workflows such as `/batch-issues` and `/drain-issues` only use sub-agents when the user explicitly asks for delegation or parallelism.
-- Review-heavy workflows use native `codex review` or `codex exec review` semantics instead of Claude-specific command frontmatter.
+- Codex uses a user-global skill instead of a Claude slash-command directory.
+- Codex subagents implement independent issues in isolated worktrees.
+- Claude receives only `Read`, `Grep`, and `Glob`; it cannot edit, run Bash,
+  push, or merge. A Codex fallback runs in a separate ephemeral
+  process with a read-only sandbox, approvals disabled, and user config, rules,
+  MCP, and web search disabled.
+- Fallback occurs when Claude is unavailable, times out, exceeds quota, returns
+  malformed output, or returns `INCONCLUSIVE`. Valid `CHANGES_REQUESTED` and
+  `BLOCKED` verdicts remain final and cannot be overruled by fallback.
+- Every review is structured JSON and bound to exact head, base, and merge-base
+  SHAs. Provider provenance is runner-generated; invalid, stale, timed-out,
+  failed-fallback, or inconclusive reviews block progress.
+- Each gate isolates reviewer evidence from prompt input, sticky provider state,
+  output artifacts, diagnostics, and provider-specific temporary files.
+- A run-shared gate ledger consumes each Codex fallback session before launch.
+  One completed schema/semantic-invalid generation gets a single
+  validator-guided repair; resuming the same gate cannot start another session.
+- Successful fallback is silent during execution. Final output includes one
+  compact provider/trigger summary; only failed fallback interrupts progress.
+- Plan diagnosis/fix-impact gates use curated evidence, medium effort, and a
+  five-minute budget. The 15-minute high-effort window is reserved for final PR
+  review, preventing open-ended repository exploration from stalling planning.
 
 ## Key design principles
 
 - **Git worktrees for isolation** — `/fix-issue`, `/quick-fix`, `/batch-issues`, and `/drain-issues` create worktrees so you can work on multiple issues in parallel without conflicts
 - **Full issue context** — Commands fetch the issue body *and all comments* before touching code. Reproduction steps, design decisions, and constraints often live in the thread, not the original description
-- **Plan before building** — `/issue-pipeline --plan-review` runs a Claude↔Codex refinement loop on the implementation plan before writing a single line of code. Up to 3 rounds: original plan → Codex critique → Claude refines
+- **Plan before building** — plan review is enabled by default: the plan is drafted,
+  then reviewed once by an independent read-only reviewer that checks diagnosis and
+  fix impact against the real code before implementation; the findings are absorbed
+  into the plan and coding starts
 - **Root cause over surface fixes** — Commands explicitly warn against z-index hacks, retry loops, and other band-aids. They push for understanding *why* before fixing
 - **Test-driven fixes** — Write a failing test first, then implement the fix
 - **Conventional commits** — All commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) spec
@@ -400,7 +450,8 @@ Porting notes:
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
 - [GitHub CLI](https://cli.github.com/) (`gh`) — for issue/PR commands
 - Git
-- [Codex CLI](https://github.com/openai/codex) *(optional)* — only needed for `/full-review`
+- [Codex CLI](https://github.com/openai/codex) — primary orchestrator for the
+  Codex skill
 
 ## License
 

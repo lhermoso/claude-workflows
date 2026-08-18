@@ -111,9 +111,11 @@ ITERATION_HISTORY = ""
 
 Build the Codex review prompt. It includes the three review gates, scope guardrails, the PR + issue context, and (from iteration 2) the iteration history.
 
-**IMPORTANT — command form.** `codex exec review --base <branch>` is **mutually exclusive with a custom PROMPT**. We need a custom prompt, so we use `codex exec review` *without* `--base` and instruct Codex in-prompt to diff `HEAD` against `origin/$BASE_BRANCH`.
+**IMPORTANT — command form.** We need a custom prompt, and `codex exec review --base <branch>` is **mutually exclusive with a custom PROMPT** — one of several reasons the `review` subcommand is not used here (see below). We run `codex exec` and instruct Codex in-prompt to diff `HEAD` against `origin/$BASE_BRANCH`.
 
-**IMPORTANT — flags (verified on codex-cli 0.136.0).** `codex exec review` accepts NEITHER `-s/--sandbox` NOR `-a/--ask-for-approval` NOR `--full-auto` — passing any of them errors (`unexpected argument '-s' found`). It runs read-only + non-interactive by default. Use only `--ephemeral --json --title`. Use Codex's default model (no `--model` / no `-c model=...`).
+**IMPORTANT — flags (verified on codex-cli 0.136.0).** Use `codex exec - -s workspace-write --ephemeral --json` with a writable `TMPDIR`. Do **not** use `codex exec review`: it accepts NEITHER `-s/--sandbox` NOR `-a/--ask-for-approval` NOR `--full-auto` (passing any errors with `unexpected argument '-s' found`), which pins it to read-only forever — and read-only is exactly what breaks the review (see the runner block). `codex exec` also rejects `--title`. Use Codex's default model (no `--model` / no `-c model=...`).
+
+**IMPORTANT — the `review` subcommand is retired here.** Besides being stuck read-only, `codex exec review` hangs **silently**: the process stays alive but emits only `thread.started` + `turn.started` (~2 JSONL events), never runs a command, and never errors — observed freezing 20–34 min on a small diff, while a trivial `codex exec` ping returned fine in the same window (so codex/auth is alive; the stall is specific to the `review` path's model call). It burned ~10 min of watchdog time per iteration on PR #1325 and never once produced output. The in-prompt "diff HEAD vs origin/$BASE_BRANCH" instruction means it adds nothing essential. `codex exec` can itself hang *before* the final consolidated message — so the parser collects **all** `agent_message` events (codex streams substantive findings across intermediate messages), not just the last.
 
 **Prompt template (all iterations) — assemble into `$REVIEW_PROMPT`:**
 
@@ -124,6 +126,7 @@ SCOPE
 - Diff HEAD against origin/$BASE_BRANCH. Review only files changed in that diff, plus the directly-affected execution paths.
 - The PR's stated intent is: $PR_INTENT_ONE_LINE.
 - Do NOT request unrelated refactors or cleanup of code the PR did not touch (smells in untouched files are out of scope).
+- YOU are the reviewer. Do NOT invoke the `gh-workflow-suite` skill, and do NOT run `scripts/run_review.py` or any other review gateway. Those spawn a nested reviewer subprocess which cannot initialize inside this sandbox (`failed to initialize in-process app-server client: Operation not permitted`), and the gateway then fails closed to `INCONCLUSIVE`/exit 6 with zero findings. Inspect the diff yourself and emit the report in your own final message.
 - EXCEPTION — completeness/security carve-out: if satisfying an explicit acceptance criterion or closing a realistic security hole genuinely requires touching a non-diff file, you MAY raise it. Name the file and explain why changed files alone cannot fix it. If the fix is broad/architectural/risky, mark it BLOCKED with a remediation plan rather than waving it through.
 
 PR AND ISSUE CONTEXT
@@ -202,42 +205,120 @@ OUTPUT CONTRACT
 - If the diff is clean across all three gates, approve with LGTM — do not invent findings to justify a round.
 ```
 
-Run the review as a **single** invocation, capturing both stdout and stderr, then parse the captured JSONL (do NOT run Codex twice):
+Write the assembled prompt to a file and run via the **watchdog runner** below. It runs `codex exec - -s workspace-write` with an explicit writable `TMPDIR`. Capture stdout and stderr; parse the captured JSONL.
+
+**Why `workspace-write` + `TMPDIR` and not `read-only`** (root-caused on PR #1325, 2026-07-25): under `-s read-only` the sandbox denies writes to *every* temp candidate, so the `gh-workflow-suite` gateway self-test dies before the review starts:
+
+```
+run_review.py:1494  tempfile.TemporaryDirectory(prefix="review-self-source-")
+FileNotFoundError: [Errno 2] No usable temporary directory found in
+['/var/folders/.../T/', '/tmp', '/var/tmp', '/usr/tmp', '<cwd>']
+```
+
+That skill is **fail-closed**: no gateway → it may not issue `APPROVE`, so it emits `VERDICT: BLOCKED` even with zero findings. Read-only also means Codex can never execute a test, so every finding is static inference. `workspace-write` + writable `TMPDIR` fixes both. Verified 2026-07-28: the same self-test that returned exit 1 above returns `{"ok": true, "tests": 28}` exit 0, and the worktree stayed clean (`git status` empty). Separately observed 2026-07-25 on epic #1188: with the write bit Codex executed the real PostgreSQL suite and confirmed fixes by running them instead of by reading. **`workspace-write` does not mean Codex edits your code during review** — the prompt is read-and-report; it needs the write bit for temp files and test runners.
 
 ```bash
+# Write the prompt to a file: avoids ARG_MAX and shell-quoting issues. If you
+# assembled $REVIEW_PROMPT with cat/heredoc, make sure the PR/issue bodies were
+# appended RAW (never via an unquoted heredoc) or backticks in the PR body get
+# command-substituted.
+REVIEW_PROMPT_FILE=$(mktemp -t nuclear-review-prompt-XXXX.md)
+printf '%s' "$REVIEW_PROMPT" > "$REVIEW_PROMPT_FILE"
+
 CODEX_OUT=$(mktemp -t codex-review-out-XXXX.jsonl)
 CODEX_ERR=$(mktemp -t codex-review-err-XXXX.log)
 
-printf '%s' "$REVIEW_PROMPT" |
-  codex exec review - --ephemeral --json \
-    --title "$PR_TITLE" \
-    > "$CODEX_OUT" 2> "$CODEX_ERR"
+# Writable TMPDIR for the codex child. REQUIRED: the gateway self-test and any
+# test runner Codex invokes both need a usable temp dir. If your harness gives
+# you a session scratchpad, point this at it instead (verified-good); mktemp -d
+# is the portable default.
+CODEX_TMPDIR=$(mktemp -d -t nuclear-codex-tmp-XXXX)
+mkdir -p "$CODEX_TMPDIR" && [ -w "$CODEX_TMPDIR" ] || {
+  echo "FATAL: no writable TMPDIR for codex ($CODEX_TMPDIR)" >&2; return 1 2>/dev/null || exit 1; }
 
-REVIEW_TEXT=$(python3 - "$CODEX_OUT" <<'PY'
+# Watchdog runner. macOS has no `timeout`/`setsid`, so we background codex and
+# kill it if its JSONL output stops growing for STALL_SECS while still alive
+# (the silent-hang signature), or if it exceeds MAX_SECS overall.
+# NOTE: this script sleeps internally — if your harness blocks foreground
+# `sleep`, launch this whole block as a background Bash command (run_in_background)
+# and read $CODEX_OUT when notified.
+run_codex() {
+  local label="$1"; shift            # remaining args = codex argv
+  : > "$CODEX_OUT"; : > "$CODEX_ERR"
+  ( cat "$REVIEW_PROMPT_FILE" | TMPDIR="$CODEX_TMPDIR" "$@" > "$CODEX_OUT" 2> "$CODEX_ERR" ) &
+  # STALL_SECS=420: codex legitimately goes >150s between JSONL events during
+  # long reasoning — 150 killed healthy runs mid-review (PARTIAL_REVIEW).
+  local pid=$! STALL_SECS=420 MAX_SECS=1800 last=0 stalled=0 elapsed=0 now
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 15; elapsed=$((elapsed+15))
+    now=$(wc -l < "$CODEX_OUT" 2>/dev/null | tr -d ' '); now=${now:-0}
+    if [ "$now" -gt "$last" ]; then last="$now"; stalled=0; else stalled=$((stalled+15)); fi
+    if [ "$stalled" -ge "$STALL_SECS" ] || [ "$elapsed" -ge "$MAX_SECS" ]; then
+      echo "[$label] watchdog kill: stalled=${stalled}s elapsed=${elapsed}s last=${last} events" >&2
+      kill "$pid" 2>/dev/null; pkill -P "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      return 124
+    fi
+  done
+  wait "$pid" 2>/dev/null; return 0
+}
+
+# Parse ALL agent_message events. Codex streams substantive findings across
+# intermediate messages and may hang before the final consolidated one; prefer
+# the last message carrying a VERDICT line or the AC matrix, else emit every
+# streamed message tagged PARTIAL_REVIEW so a hang-before-summary still surfaces
+# the findings.
+parse_review() {
+  python3 - "$CODEX_OUT" <<'PY'
 import json, sys
-review = None
+msgs = []
 with open(sys.argv[1]) as f:
     for line in f:
         line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except Exception:
-            continue
+        if not line: continue
+        try: event = json.loads(line)
+        except Exception: continue
         if event.get("type") == "item.completed":
             item = event.get("item", {})
             if item.get("type") == "agent_message" and item.get("text"):
-                review = item["text"]
-print(review if review else "NO_REVIEW_OUTPUT")
+                msgs.append(item["text"])
+if not msgs:
+    print("NO_REVIEW_OUTPUT"); sys.exit()
+final = [m for m in msgs if "VERDICT:" in m or "AC Coverage Matrix" in m]
+if final:
+    print(final[-1])
+else:
+    print("PARTIAL_REVIEW (no VERDICT line — codex likely hung before final summary):\n\n"
+          + "\n\n---\n\n".join(msgs))
 PY
-)
+}
+
+# Single path: `codex exec` with a writable sandbox. The `codex exec review`
+# subcommand is deliberately NOT used — it rejects `-s`, so it is permanently
+# stuck read-only and can never satisfy the gateway self-test or run a test.
+# It has also hung silently on every observed run. The in-prompt "diff HEAD vs
+# origin/$BASE_BRANCH" instruction makes `exec` a faithful substitute.
+run_codex "exec-workspace-write" codex exec - -s workspace-write --ephemeral --json
+REVIEW_TEXT=$(parse_review)
+
+# One retry on empty/partial output (transient model or network stall).
+if [ "$REVIEW_TEXT" = "NO_REVIEW_OUTPUT" ] || printf '%s' "$REVIEW_TEXT" | grep -q '^PARTIAL_REVIEW'; then
+  echo "codex exec produced empty/partial output — retrying once" >&2
+  run_codex "exec-workspace-write-retry" codex exec - -s workspace-write --ephemeral --json
+  REVIEW_TEXT=$(parse_review)
+fi
+
+# Surface a gateway-preflight failure explicitly: it is NOT a code finding, but
+# it does mean the review ran degraded (no test execution). See Phase 2.
+if grep -qi 'No usable temporary directory\|gateway.*\(self-test\|preflight\)' "$CODEX_ERR" "$CODEX_OUT" 2>/dev/null; then
+  echo "WARNING: gateway preflight failed despite writable TMPDIR ($CODEX_TMPDIR) — treat any BLOCKED verdict as infra, not code" >&2
+fi
+
 echo "$REVIEW_TEXT"
 ```
 
 (Note: `--base` is deliberately omitted. Codex infers the diff from the in-prompt instruction to diff `HEAD` vs `origin/$BASE_BRANCH`.)
 
-This may take 3-10 minutes. That is normal — Codex is doing a thorough, file-aware review.
+This may take 3-10 minutes (longer if the retry fires). That is normal — Codex is doing a thorough, file-aware review, and with `workspace-write` it may also be running the test suite.
 
 ## Phase 2: Parse the Review
 
@@ -245,8 +326,12 @@ Read the final `VERDICT:` line — it is authoritative. Then cross-check against
 
 1. **`VERDICT: LGTM`** (and no `[P1]`/`[P2]` tags of any kind remain) → APPROVED, skip to Phase 4.
 2. **`VERDICT: CHANGES_REQUESTED`**, or any `[P1]`/`[P2]` tag (`[AC]`, `[SECURITY]`, or correctness) present → proceed to Phase 3.
-3. **`VERDICT: BLOCKED`** → a blocking AC/security finding needs a fix too big for this PR. Do NOT approve. Open a follow-up issue with the remediation plan, report the PR as **incomplete/blocked**, and stop the loop.
-4. **`NO_REVIEW_OUTPUT`** → DO NOT treat as approved. Empty output means Codex failed to run. Inspect `$CODEX_ERR` for the cause (auth, rate-limit, ARG_MAX, prompt-too-large, network). Retry the codex invocation ONCE. If the retry is also empty, abort the loop and report status `inconclusive` with the stderr head — never auto-merge on inconclusive review.
+3. **`VERDICT: BLOCKED`** → **count the findings before acting; the verdict line alone is not the signal.** There are three distinct causes:
+   - **Real block** — a `[P1]/[P2]` `[AC]`/`[SECURITY]` finding needs a fix too big for this PR. Do NOT approve. Open a follow-up issue with the remediation plan, report the PR as **incomplete/blocked**, and stop the loop.
+   - **Degraded** — the gateway failed but Codex inspected the diff anyway and returned real findings (look for "findings come from manual committed-diff inspection"). **The findings are valid** — treat them on their merits and continue the loop.
+   - **Infra abort** — zero findings, and the prose blames Codex's own tooling ("Gateway self-check failed"; "Blocker is review infrastructure, not requested code changes"). This is a **failed** review, not an approval and not a code block. Re-run with a writable `TMPDIR` and `-s workspace-write`. If it still aborts, say the review is **inconclusive** — never approve on it, and never present your own test runs as if they were the independent gate.
+4. **`NO_REVIEW_OUTPUT`** → DO NOT treat as approved. Empty output means Codex failed to run AND the `exec` fallback also produced nothing. Inspect `$CODEX_ERR` for the cause (auth, rate-limit, ARG_MAX, prompt-too-large, network). The runner already retried once via the fallback; do not loop indefinitely. If still empty, abort the loop and report status `inconclusive` with the stderr head — never auto-merge on inconclusive review.
+5. **`PARTIAL_REVIEW …`** (prefix) → Codex did real analysis but hung before the final consolidated VERDICT/AC-matrix message (common on the `exec` fallback). The streamed `agent_message`s are included — read them. If they contain substantive across-the-gates findings with **no `[P1]`/`[P2]` tags** (Codex's text explicitly confirming the fix/clean gates), treat it like a clean run for gating purposes but, per the verdict-line-unreliability rule, **require two such consecutive P1/P2-free runs** before approving. If any `[P1]`/`[P2]` is present in the streamed text, proceed to Phase 3. Do NOT approve on a single partial with no corroboration.
 
 Print the full review text (including the AC Coverage Matrix) so the user can see what Codex found.
 
@@ -345,7 +430,8 @@ Follow-up issues opened (if any):
 
 ## Important Notes
 
-- The `codex exec review` subcommand runs read-only + non-interactive by default, so it can read all project files (and the linked issue context baked into the prompt) without any sandbox/approval flags. It rejects `-s`, `-a`, and `--full-auto` — pass only `--ephemeral --json --title` (verified on codex-cli 0.136.0).
+- **Sandbox:** run `codex exec - -s workspace-write --ephemeral --json` with `TMPDIR` pointed at a writable dir. Read-only starves the `gh-workflow-suite` gateway self-test (`tempfile.TemporaryDirectory` → `No usable temporary directory found`), which makes it fail closed to `BLOCKED`, and it also prevents Codex from running a single test. `workspace-write` is for temp files and test runners, not code edits — the worktree stayed clean across verified runs.
+- **`codex exec review` is retired:** it rejects `-s`/`-a`/`--full-auto` (so it can never leave read-only) and hangs silently after `turn.started`. Use `codex exec` only. Parse **all** `agent_message` events, not just the last — `exec` may hang before the final summary, and its intermediate messages carry the real findings (`PARTIAL_REVIEW`). (macOS lacks `timeout`/`setsid` — the watchdog backgrounds codex and kills on stall instead. STALL_SECS=420 / MAX_SECS=1800; 150s killed healthy runs mid-review.)
 - Tags: `[P1]` critical, `[P2]` major, `[P3]` minor — suffixed with `[AC]` (acceptance criteria) or `[SECURITY]` for those gates. Only `[P1]`/`[P2]` block approval.
 - The iteration history is passed to Codex each round so it knows what was fixed/dismissed. If Codex re-raises a *correctness* issue already dismissed, skip it. **Never** skip a re-raised `[AC]`/`[SECURITY]` issue on those grounds.
 - Approval is gated on the `VERDICT:` line AND zero open `[P1]`/`[P2]` across all three gates — not on fuzzy phrases like "looks good".
