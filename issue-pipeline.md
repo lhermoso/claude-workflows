@@ -56,6 +56,7 @@ Rules:
 3. **Coders never plan.** The coder receives a finished `.pair/PLAN.md`. If it concludes the plan is wrong, it stops and returns `plan_rejected` with evidence — the planner (fable) revises, then the coder resumes.
 4. **Reviewers never write code.** A reviewer emits verdicts and a precise fix list; a coder applies it.
 5. **Codex is unchanged** — external adversarial reviewer on its own default model. Never pass `--model` / `-c model=...` to Codex.
+6. **Subagents run Codex in the FOREGROUND.** Any agent launched via `Task` (planner, reviewer, coder) must invoke `codex exec` as a **blocking** call and stay in the same turn until it returns. Never start Codex with `run_in_background` and then end the turn waiting for a task notification — **a subagent is not woken by its own background task**, so the turn simply ends and the agent sits idle until the orchestrator notices (observed: ~20 min lost per planner). If something is backgrounded anyway, poll it with `BashOutput` in a loop **within the same turn** until it exits. Only the main pipeline loop may background work and rely on being re-invoked.
 
 ---
 
@@ -244,6 +245,7 @@ Goal: ONE adversarial Codex pass over the finished plan, checked against the **a
 **Bookkeeping:**
 - Run Codex from the worktree root so it reads real files.
 - Write the Codex output to `.pair/REVIEW.md` under a `## Codex Plan Review` header.
+- **Run Codex in the FOREGROUND — it is a blocking call.** Do NOT use `run_in_background` and do NOT end your turn waiting for a notification: you are a subagent, nothing will wake you, and the plan review stalls until the pipeline notices. Normal runtime is 3–10 min — wait it out in this turn. If you background it anyway, poll `BashOutput` in a loop in this same turn until the process exits.
 - Always pipe the prompt via stdin (per CLAUDE.md — large prompts as positional args silently hang).
 - Capture stderr — empty stdout ≠ approval. Retry ONCE on empty output; if the second attempt is also empty, log a warning, set `plan_review: "unavailable"`, and hand the unreviewed plan to the coder.
 
