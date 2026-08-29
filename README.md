@@ -248,10 +248,10 @@ Autonomous issue processor — analyzes dependencies between issues, batches ind
 | `--full-review` | `false` | Use Claude↔Codex review loop instead of basic review |
 | `--get-all` | `false` | Process all open issues regardless of assignment. By default, issues already assigned to someone else are skipped |
 | `--plan-model=M` | `fable` | Model for planner agents (`fable\|opus\|sonnet\|haiku`) |
-| `--code-model=M` | `sonnet` | Model for coder agents |
+| `--code-model=M` | `opus` | Model for coder agents |
 | `--review-model=M` | `fable` | Model for reviewer agents |
 
-**Model routing:** planning (root cause, `.pair/PLAN.md`, the single Codex plan review) and reviewing (plan-adherence verification, Codex finding triage, merge decision) run on **claude-fable-5**, falling back to **opus** if fable is unavailable. Code — tests, implementation, review fixes, commits, PRs — is written by **claude-sonnet-5**. A planner never implements and a reviewer never edits files; fixes always go back through a coder agent.
+**Model routing:** planning (root cause, `.pair/PLAN.md`, the single Codex plan review) and reviewing (plan-adherence verification, Codex finding triage, merge decision) run on **claude-fable-5**, falling back to **opus** if fable is unavailable. Code — tests, implementation, review fixes, commits, PRs — is written by **claude-opus-5**. A planner never implements and a reviewer never edits files; fixes always go back through a coder agent.
 
 **How it works:**
 1. Fetches all open issues (or filtered subset), skipping issues assigned to others (unless `--get-all`)
@@ -259,7 +259,7 @@ Autonomous issue processor — analyzes dependencies between issues, batches ind
 3. Groups independent issues into waves
 4. Presents wave plan and waits for confirmation
 5. **Assigns itself** to all issues in the wave before starting work (claims them)
-6. Processes each wave: planner agents (fable) write reviewed plans in worktrees → coder agents (sonnet) implement and open PRs → reviewer agents (fable) verify and triage → merge
+6. Processes each wave: planner agents (fable) write reviewed plans in worktrees → coder agents (opus) implement and open PRs → reviewer agents (fable) verify and triage → merge
 7. Cleans up worktrees after each merge
 8. Moves to next wave until all issues are processed
 9. Final summary with merged PRs, failed items, and cleanup commands
@@ -310,10 +310,10 @@ Full pipeline: create an issue (if needed), fix it, create a PR, and self-review
 | `--plan-review` | Redundant — one Codex plan review before implementation is the default (disable with `--no-plan-review`) |
 | `--full-review` | Claude↔Codex iterative review loop after implementation |
 | `--plan-model=M` | Model for the planner agent (default `fable`, fallback `opus`) |
-| `--code-model=M` | Model for the coder agent (default `sonnet`) |
+| `--code-model=M` | Model for the coder agent (default `opus`) |
 | `--review-model=M` | Model for reviewer agents (default `fable`, fallback `opus`) |
 
-**Model routing:** the plan and every review run on **claude-fable-5** (fallback **opus**); the code is written by **claude-sonnet-5**. Planner, coder, and reviewer are separate agents — the coder cannot silently redesign the plan (it must return `plan_rejected` instead), and the reviewer cannot edit files.
+**Model routing:** the plan and every review run on **claude-fable-5** (fallback **opus**); the code is written by **claude-opus-5**. Planner, coder, and reviewer are separate agents — the coder cannot silently redesign the plan (it must return `plan_rejected` instead), and the reviewer cannot edit files.
 
 **How it works:**
 1. **Detects mode:** number → fix existing issue; text → create new issue first
@@ -321,7 +321,7 @@ Full pipeline: create an issue (if needed), fix it, create a PR, and self-review
 3. **Sharpens the problem statement:** Codex pre-analyzes the issue and produces a precise problem statement (root cause hypothesis, affected files, edge cases, success criteria)
 4. **Planner agent (fable)**: creates worktree → investigates root cause → specifies the failing test → writes `.pair/PLAN.md`
 5. **Plan review** (default; `--no-plan-review` to skip): Codex reviews the plan **once** against the real code — diagnosis and fix side-effects in one pass → the planner absorbs the findings into `.pair/PLAN.md` → hand off. No re-review round
-6. **Coder agent (sonnet)**: writes the failing test → implements with minimal changes → runs tests + linter → updates changelog → commits → creates PR
+6. **Coder agent (opus)**: writes the failing test → implements with minimal changes → runs tests + linter → updates changelog → commits → creates PR
 7. **Reviewer agent (fable):** plan-adherence Implementation Report, then basic review (default) or Claude↔Codex loop (`--full-review`) — accepted fixes go back to a coder agent
 8. **Improvement passes:** up to 2 Codex-powered quality passes on the finished implementation (better abstractions, naming, edge cases)
 9. **Merges if safe**, or reports what needs attention
