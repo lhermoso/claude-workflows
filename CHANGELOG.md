@@ -52,9 +52,9 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
   (plan-adherence verification + Implementation Report, Codex `[P1]`/`[P2]` triage,
   basic diff review, improvement-pass triage, merge decision) run on
   **claude-fable-5**, with a single automatic retry on **opus** if fable is
-  unavailable — never a downgrade to sonnet. All code — failing test,
+  unavailable — never a downgrade to a smaller model. All code — failing test,
   implementation, lint/test runs, changelog, commits, PRs, and applied review
-  fixes — is written by **claude-sonnet-5**. Consequences: the monolithic fix
+  fixes — is written by **claude-opus-5**. Consequences: the monolithic fix
   subagent is split into a planner agent and a coder agent (the coder returns
   `plan_rejected` with evidence instead of silently redesigning; one planner
   round-trip is allowed); reviewers emit fix lists but never edit files;

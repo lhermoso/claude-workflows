@@ -1,7 +1,7 @@
 ---
 allowed-tools: Bash(git:*), Bash(gh:*), Task
 argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all] [--no-plan-review] [--basic-review] [--no-verify] [--plan-model=M] [--code-model=M] [--review-model=M]
-description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Plans and reviews run on claude-fable-5 (fallback opus), code is written by claude-sonnet-5. ALL quality gates ON by default: a single Codex plan review before coding, plan-adherence verification after coding, and the Claude↔Codex full-review loop before merge. Opt out with --no-plan-review / --no-verify / --basic-review.
+description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Plans and reviews run on claude-fable-5 (fallback opus), code is written by claude-opus-5. ALL quality gates ON by default: a single Codex plan review before coding, plan-adherence verification after coding, and the Claude↔Codex full-review loop before merge. Opt out with --no-plan-review / --no-verify / --basic-review.
 ---
 
 # Autonomous Issue Drainer
@@ -32,7 +32,7 @@ Arguments: **$ARGUMENTS**
 | `--no-verify` | false | Skip the DEFAULT Phase 5.5 plan-adherence verification: an inline pass checks each plan claim against the PR diff, reverse-traces unplanned changes, and posts an Implementation Report on each PR. PLAN_NOT_MET PRs are blocked from auto-merge. |
 | `--get-all` | false | Process all open issues regardless of who is assigned. Without this flag, issues already assigned to someone else are skipped. |
 | `--plan-model=M` | `fable` | Override the planner model (`fable\|opus\|sonnet\|haiku`). |
-| `--code-model=M` | `sonnet` | Override the coder model. |
+| `--code-model=M` | `opus` | Override the coder model. |
 | `--review-model=M` | `fable` | Override the reviewer model. |
 
 The legacy `--plan-review` / `--full-review` flags are accepted but redundant — they are now the default behavior. Fastest escape hatch (roughly the old default): `--no-plan-review --no-verify --basic-review`.
@@ -45,14 +45,14 @@ The legacy `--plan-review` / `--full-review` flags are accepted but redundant �
 |------|--------|-------|----------|
 | **Planner** | root-cause investigation, writing and revising `.pair/PLAN.md`, running the single Codex plan review and absorbing its findings | `fable` (claude-fable-5) | `opus` |
 | **Reviewer** | plan-adherence verification + Implementation Report, basic diff review, triaging Codex `[P1]`/`[P2]` findings, merge decisions | `fable` (claude-fable-5) | `opus` |
-| **Coder** | failing test, implementation, lint/test runs, CHANGELOG, commits, PR creation, applying fixes the reviewer decided to accept | `sonnet` (claude-sonnet-5) | — |
+| **Coder** | failing test, implementation, lint/test runs, CHANGELOG, commits, PR creation, applying fixes the reviewer decided to accept | `opus` (claude-opus-5) | — |
 
 Rules:
 
 1. **Every `Task` launch passes an explicit `model`.** Never inherit the session model — the routing above is the contract.
-2. **Fable fallback:** if a launch with `model: fable` fails because the model is unavailable/invalid/over quota, retry the *identical* launch once with `model: opus`, and log `⚠️ fable unavailable — <role> downgraded to opus`. Never fall back to `sonnet` for a planner or reviewer role: sonnet writes code, it does not plan or judge.
+2. **Fable fallback:** if a launch with `model: fable` fails because the model is unavailable/invalid/over quota, retry the *identical* launch once with `model: opus`, and log `⚠️ fable unavailable — <role> downgraded to opus`. Never downgrade a planner or reviewer to a smaller model (`sonnet`/`haiku`): planning and judging stay on fable or opus.
 3. **Coder agents never plan.** A coder receives a finished `.pair/PLAN.md` and implements it. If the coder believes the plan is wrong, it stops and returns `"status": "plan_rejected"` with the reason — the planner (fable) revises, then the coder resumes. Coders do not silently redesign.
-4. **Reviewers never write code.** A reviewer produces verdicts and a fix list; the fixes are applied by a coder agent (sonnet).
+4. **Reviewers never write code.** A reviewer produces verdicts and a fix list; the fixes are applied by a coder agent (opus).
 5. **Codex is unchanged** — it stays the external adversarial reviewer on its own default model. Never pass `--model` / `-c model=...` to Codex.
 6. The dependency/wave analysis in Phases 2–3 is planning work; when it is non-trivial (>10 issues or ambiguous chains), delegate it to a planner agent (`fable`) instead of doing it in the main loop.
 
@@ -350,12 +350,12 @@ Do NOT re-run Codex on the revised plan. Set `plan_review: "reviewed"` and hand 
 After the review is absorbed, the plan is final. Do NOT commit `.pair/` — it is gitignored working-notes scratch and must stay local to the worktree. Never `git add -f` it. If the pair-session reasoning is worth preserving in the PR record, mirror a concise summary into the PR body instead. `.pair/CONTEXT.md` follows the same rule: local to the worktree, never committed, and never deleted before Phase 5.5 has run. Then return the planner JSON above."
 ```
 
-### Step 4.2: Launch Coder Agents (model: `sonnet`)
+### Step 4.2: Launch Coder Agents (model: `opus`)
 
-For each issue whose planner returned `"status": "success"`, launch a **coder** Task agent with `model: "sonnet"`. Coders run in the planner's worktree and implement the approved plan — nothing more.
+For each issue whose planner returned `"status": "success"`, launch a **coder** Task agent with `model: "opus"`. Coders run in the planner's worktree and implement the approved plan — nothing more.
 
 ```
-Launch N parallel Task agents with model: "sonnet" (respecting --max-parallel):
+Launch N parallel Task agents with model: "opus" (respecting --max-parallel):
 
 Each coder receives:
 "Implement issue #XX from an already-reviewed plan. You are the CODER — the plan is the contract. Do not re-plan, do not redesign.
@@ -392,13 +392,13 @@ If wave has 4+ issues, split into sub-batches of 2. Each sub-batch runs plan →
 ```
 Wave 1 has 6 issues: [#12, #15, #22, #41, #28, #33]
 
-Sub-batch 1: plan #12, #15 in parallel (fable) → code #12, #15 in parallel (sonnet)
+Sub-batch 1: plan #12, #15 in parallel (fable) → code #12, #15 in parallel (opus)
   → Collect minimal results
 
-Sub-batch 2: plan #22, #41 (fable) → code #22, #41 (sonnet)
+Sub-batch 2: plan #22, #41 (fable) → code #22, #41 (opus)
   → Collect minimal results
 
-Sub-batch 3: plan #28, #33 (fable) → code #28, #33 (sonnet)
+Sub-batch 3: plan #28, #33 (fable) → code #28, #33 (opus)
   → Collect minimal results
 ```
 
@@ -496,7 +496,7 @@ Status mapping: `MATCHED` → ✅ · `DIVERGED` → 🔀 · `MISSING` → ❌ ·
 ### Step 4 — Record per-PR verdict (gates Phase 6)
 
 - **PLAN_MET:** no ❌ on any `ac` or `test` claim.
-- **PLAN_NOT_MET:** at least one ❌ on an `ac` or `test` claim. Attempt ONE fix cycle, respecting role separation: relaunch a **coder agent (`sonnet`)** in that worktree with the reviewer's `failed_claims[]` and instructions to apply only the missing pieces, commit and push; then relaunch the **reviewer agent (`fable`)** to re-verify **only the failed claims** (not the whole list). If still failing → the PR is **blocked from auto-merge** in Phase 6; leave it open with the report comment as the record and move on.
+- **PLAN_NOT_MET:** at least one ❌ on an `ac` or `test` claim. Attempt ONE fix cycle, respecting role separation: relaunch a **coder agent (`opus`)** in that worktree with the reviewer's `failed_claims[]` and instructions to apply only the missing pieces, commit and push; then relaunch the **reviewer agent (`fable`)** to re-verify **only the failed claims** (not the whole list). If still failing → the PR is **blocked from auto-merge** in Phase 6; leave it open with the report comment as the record and move on.
 
 ```
 Wave 1 Verification Summary:
@@ -518,8 +518,8 @@ Carry each PR's 🔀 and ➕ items into its Phase 6 review prompt — they are t
 
 There are two review modes. **Full review is the DEFAULT.** Use basic only if `--basic-review` was passed:
 
-- **Default (full review):** Uses the Claude↔Codex review loop — Codex reviews the PR, a **reviewer agent (`fable`)** triages the findings, a **coder agent (`sonnet`)** applies the accepted fixes, repeat until Codex approves (max 15 iterations). Thorough (~5-15 min per PR). Codex receives iteration history so it won't re-raise dismissed issues.
-- **`--basic-review` mode:** A **reviewer agent (`fable`)** reviews the diff for breaking changes, regressions, missing changelog, etc. Fast (~1-2 min per PR). Any fixes it asks for are applied by a coder agent (`sonnet`).
+- **Default (full review):** Uses the Claude↔Codex review loop — Codex reviews the PR, a **reviewer agent (`fable`)** triages the findings, a **coder agent (`opus`)** applies the accepted fixes, repeat until Codex approves (max 15 iterations). Thorough (~5-15 min per PR). Codex receives iteration history so it won't re-raise dismissed issues.
+- **`--basic-review` mode:** A **reviewer agent (`fable`)** reviews the diff for breaking changes, regressions, missing changelog, etc. Fast (~1-2 min per PR). Any fixes it asks for are applied by a coder agent (`opus`).
 
 **Verification gate (from Phase 5.5):** a PR marked PLAN_NOT_MET is NEVER auto-merged, regardless of review outcome — review it anyway (the findings are still useful), but leave it open with a comment pointing at the Implementation Report. Include each PR's 🔀 diverged and ➕ unplanned items in the review prompt.
 
@@ -536,7 +536,7 @@ for each PR in [#45, #46, #47]:
        Run the full Claude↔Codex review loop for this PR:
 
        a. Get the PR number
-       b. Execute the /full-review workflow inline, with roles split by model:
+       b. Execute the /full-review workflow inline, with roles split across separate agents:
           - Get PR info and checkout the branch
           - Initialize iteration history
           - Run Codex review via `codex exec review - --ephemeral --json` with the prompt piped on stdin (including iteration history context on rounds 2+); do NOT use `--full-auto`
@@ -546,7 +546,7 @@ for each PR in [#45, #46, #47]:
             (<file>:<line> — what to change — why). It does not edit files.
             The fix list must be SELF-CONTAINED: exact file, exact line/region, and the current
             code being changed — so the coder can act without re-reading to locate the site.
-          - CODER agent (model: "sonnet"): apply exactly the ACCEPTed fixes, run tests, commit, push.
+          - CODER agent (model: "opus"): apply exactly the ACCEPTed fixes, run tests, commit, push.
             Works from the fix list plus `.pair/CONTEXT.md`; does not re-explore the codebase.
             If a fix cannot be applied as specified, it returns the reason instead of improvising.
           - Update iteration history with outcomes (FIXED/DISMISSED) plus the dismissal reasons
@@ -554,14 +554,14 @@ for each PR in [#45, #46, #47]:
 
        c. Record the final result (approved / max iterations reached)
 
-       NOTE: the loop's fix-commit-push cycle is done by the sonnet coder; the
+       NOTE: the loop's fix-commit-push cycle is done by the opus coder; the
        accept/dismiss judgement is always fable's. After the loop completes, the PR is
        either clean (Codex approved) or has been iterated to convergence.
 
      If --basic-review mode:
        Launch a reviewer agent (model: "fable", fallback "opus") running /review-changes
        This checks: changelog, debug code, secrets, breaking changes, regressions
-       Any required fix is applied by a coder agent (model: "sonnet")
+       Any required fix is applied by a coder agent (model: "opus")
 
   2. IMMEDIATELY after review:
 
@@ -859,7 +859,7 @@ Run without --dry-run to process.
 # Trust the report, skip post-hoc verification only
 /drain-issues --no-verify
 
-# Model routing (defaults): plans + reviews on fable (fallback opus), code on sonnet
+# Model routing (defaults): plans + reviews on fable (fallback opus), code on opus
 /drain-issues
 
 # Force everything onto opus (e.g. fable is degraded)
