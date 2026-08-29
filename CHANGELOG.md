@@ -21,7 +21,7 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
 
 ### Changed
 
-- **`/drain-issues` planner agents must run Codex in the foreground**: planners were
+- **`/drain-issues` + `/issue-pipeline` planner agents must run Codex in the foreground**: planners were
   launching the plan review with `run_in_background` and ending the turn to wait for a
   task notification that can never arrive — a subagent is not woken by its own background
   task, so the agent went idle until the orchestrator noticed (~20 min lost per planner,
@@ -29,7 +29,7 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
   (planner, reviewer, coder) invokes `codex exec` as a blocking call and stays in the same
   turn until it returns, polling `BashOutput` in-turn if anything is backgrounded; only the
   main orchestrator loop may background work and rely on being re-invoked. The same rule is
-  repeated inside the planner prompt's plan-review bookkeeping so it lands in the subagent's
+  repeated inside each planner prompt's plan-review bookkeeping so it lands in the subagent's
   own context
 - **`/drain-issues` + `/issue-pipeline` plan review is now a single Codex pass**: the
   two-pass, multi-round loop (Pass A diagnosis, max 2 rounds → Pass B fix-impact, max 3
