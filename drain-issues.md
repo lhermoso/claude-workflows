@@ -54,7 +54,8 @@ Rules:
 3. **Coder agents never plan.** A coder receives a finished `.pair/PLAN.md` and implements it. If the coder believes the plan is wrong, it stops and returns `"status": "plan_rejected"` with the reason — the planner (fable) revises, then the coder resumes. Coders do not silently redesign.
 4. **Reviewers never write code.** A reviewer produces verdicts and a fix list; the fixes are applied by a coder agent (opus).
 5. **Codex is unchanged** — it stays the external adversarial reviewer on its own default model. Never pass `--model` / `-c model=...` to Codex.
-6. The dependency/wave analysis in Phases 2–3 is planning work; when it is non-trivial (>10 issues or ambiguous chains), delegate it to a planner agent (`fable`) instead of doing it in the main loop.
+6. **Subagents run Codex in the FOREGROUND.** Any agent launched via `Task` (planner, reviewer, coder) must invoke `codex exec` as a **blocking** call and stay in the same turn until it returns. Never start Codex with `run_in_background` and then end the turn waiting for a task notification — **a subagent is not woken by its own background task**, so the turn simply ends and the agent sits idle until the orchestrator notices (observed: ~20 min lost per planner). If something is backgrounded anyway, poll it with `BashOutput` in a loop **within the same turn** until it exits. Only the main orchestrator loop may background work and rely on being re-invoked.
+7. The dependency/wave analysis in Phases 2–3 is planning work; when it is non-trivial (>10 issues or ambiguous chains), delegate it to a planner agent (`fable`) instead of doing it in the main loop.
 
 ---
 
@@ -288,6 +289,7 @@ Goal: ONE adversarial Codex pass over the finished plan, checked against the **a
 **Bookkeeping:**
 - Run Codex from the worktree root so it reads real files.
 - Write the Codex output to `.pair/REVIEW.md` under a `## Codex Plan Review` header.
+- **Run Codex in the FOREGROUND — it is a blocking call.** Do NOT use `run_in_background` and do NOT end your turn waiting for a notification: you are a subagent, nothing will wake you, and the plan review stalls until the orchestrator notices. Normal runtime is 3–10 min — wait it out in this turn. If you background it anyway, poll `BashOutput` in a loop in this same turn until the process exits.
 - Always pipe the prompt via stdin (large prompts as positional args silently hang per CLAUDE.md).
 - Capture stderr — empty stdout ≠ approval. Retry ONCE on empty output. If the second attempt is also empty, log a warning, set `plan_review: "unavailable"`, and hand the unreviewed plan to the coder.
 - Use: `printf '%s' "$PROMPT" | codex exec - -s read-only --ephemeral --json 2> "$CODEX_ERR"` (read-only sandbox signals review intent, faster). `codex exec` is non-interactive and auto-approves within the sandbox — no `-a`/`--ask-for-approval` (that's a global flag and errors after `exec`) and no `--full-auto` (legacy alias; errors on `review`).
