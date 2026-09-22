@@ -21,7 +21,9 @@ REQUIRED_FILES = (
     "references/issue-pipeline.md",
     "references/drain-issues.md",
     "references/review-schema.json",
+    "references/implement-schema.json",
     "scripts/install_user_skill.py",
+    "scripts/run_claude_implement.py",
     "scripts/run_claude_review.py",
     "scripts/run_review.py",
 )

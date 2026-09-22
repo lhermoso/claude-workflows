@@ -5,9 +5,13 @@ Use these compact workflows for suite commands other than `full-review`,
 `porting-notes.md`.
 
 Every review step below means `scripts/run_review.py` with one provider-state
-file for the workflow run. Claude is preferred; any failed, invalid, or
-inconclusive Claude review activates the fresh read-only Codex fallback. The
-fallback remains fail-closed.
+file for the workflow run, `--primary codex` for anything Fable wrote and
+`--primary claude` for anything Codex wrote; any failed, invalid, or
+inconclusive primary review activates the fresh read-only fallback, which
+remains fail-closed. Every implementation step below means
+`scripts/run_claude_implement.py` in the worktree: the active Codex task
+plans, verifies, stages, and commits, but does not write production code.
+Findings are BLOCKER / HIGH / MEDIUM / LOW; only the first two block.
 
 Assign each logical gate a stable run-unique ID containing the command, target,
 stage, and round. A new snapshot or review round gets a new ID. Never rotate an
@@ -30,9 +34,10 @@ ID to retry Codex.
    merge-gating review. A review of uncommitted changes is advisory only.
 4. Push and create a draft PR with a structured body and changelog update when
    appropriate.
-5. Run a read-only review of the committed PR head through `run_review.py` and
-   an immutable snapshot. Prefer Claude; use the fresh Codex fallback whenever
-   Claude cannot produce a valid, conclusive review.
+5. Run a read-only review of the committed PR head through `run_review.py
+   --primary codex` and an immutable snapshot, with the requirements and any
+   plan as context files; the fresh fallback applies whenever the primary
+   cannot produce a valid, conclusive review.
 6. Fix blocking findings in new commits, retest, push, and re-review after every
    mutation. Mark the PR ready only after the current committed head passes.
 
@@ -40,9 +45,11 @@ ID to retry Codex.
 
 1. Fetch the full issue body and comments.
 2. Create a unique worktree and branch from the fetched default branch.
-3. Diagnose the root cause and write a test first when supported.
-4. Implement the smallest complete fix, test, lint/typecheck, update the
-   changelog when user-visible, and commit explicit paths.
+3. Diagnose the root cause, write `plan.md` (with a failing-first test) and
+   `context.md`.
+4. Run the implementer on them; on `success`, verify (tests, lint/typecheck,
+   `git diff --check`, `changed_files` within scope), update the changelog when
+   user-visible, and commit explicit paths.
 5. Push and open a linked draft PR, then run the provider-gateway review against
    its committed head. Put each accepted fix in a new commit, retest, push, and
    re-review before marking ready.
@@ -60,11 +67,14 @@ ID to retry Codex.
 ## Review PR and Review Changes
 
 1. Build an immutable diff snapshot and relevant issue/PR context.
-2. Invoke `run_review.py`. Claude is preferred; if it fails, returns invalid
-   output, or returns `INCONCLUSIVE`, accept one fresh ephemeral read-only Codex
-   reviewer against the identical snapshot. Never let the active authoring task
-   directly produce the gate result.
-3. Return findings first with severity and file references.
+2. Invoke `run_review.py --primary codex` with the requirements, any plan or
+   report you can find (`.pair/PLAN.md`, an `## Implementation Report` PR
+   comment), and the diff as context files. If the primary fails, returns
+   invalid output, or returns `INCONCLUSIVE`, accept one fresh read-only
+   fallback reviewer against the identical snapshot. Never let the active
+   task directly produce the gate result.
+3. Return findings first: severity, category, file:line, relevant code, why,
+   reproduction, proposed correction.
 4. Do not edit unless the user separately asked to address findings.
 5. Interact with GitHub only when requested. Comment instead of trying to approve
    a self-authored PR.
@@ -89,7 +99,8 @@ Commit first and run a new SHA-bound review for gating.
 
 1. Resolve filters such as label, range, assignee, or all-open.
 2. Create disjoint worktrees and issue ownership.
-3. Use bounded Codex workers, one writer per issue, following Fix Issue.
+3. Use bounded Codex workers, one worktree and one implementer process per
+   issue, following Fix Issue.
 4. Aggregate PRs and failures. Do not merge unless the user requested a merge
    workflow.
 

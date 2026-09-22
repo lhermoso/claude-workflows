@@ -24,11 +24,23 @@ VERDICT_EXIT_CODES = {
     "BLOCKED": 11,
     "INCONCLUSIVE": 12,
 }
-SEVERITIES = {"P1", "P2", "P3"}
-CATEGORIES = {"CORRECTNESS", "AC", "SECURITY", "TEST"}
+SCHEMA_VERSION = 2
+SEVERITIES = {"BLOCKER", "HIGH", "MEDIUM", "LOW"}
+BLOCKING_SEVERITIES = {"BLOCKER", "HIGH"}
+CATEGORIES = {"CORRECTNESS", "AC", "ARCH", "SECURITY", "TEST"}
+CARVE_OUT_CATEGORIES = {"AC", "ARCH", "SECURITY"}
 AC_STATUSES = {"COVERED", "PARTIAL", "MISSING", "NA"}
-AC_SEVERITIES = {"NONE", "P1", "P2", "P3"}
+AC_SEVERITIES = {"NONE", "BLOCKER", "HIGH", "MEDIUM", "LOW"}
 SCOPES = {"DIFF", "ADJACENT"}
+DEFECT_CHECKLIST_ITEMS = (
+    "race_conditions",
+    "state_inconsistencies",
+    "database_issues",
+    "performance_regressions",
+    "missing_edge_cases",
+    "missing_tests",
+)
+CHECKLIST_ITEM_FIELDS = {"checked", "defect_found", "evidence"}
 SECURITY_CATEGORIES = {
     "INJECTION",
     "XSS_REDIRECTS",
@@ -51,21 +63,26 @@ TOP_LEVEL_FIELDS = (
     "reviewed_base_sha",
     "reviewed_merge_base_sha",
     "summary",
+    "plan_provided",
     "findings",
     "acceptance_criteria",
     "acceptance_criteria_sources",
     "no_explicit_criteria_reason",
+    "architecture_summary",
     "security_categories_checked",
     "security_summary",
+    "defect_checklist",
 )
 FINDING_FIELDS = {
     "id",
     "category",
     "severity",
     "title",
-    "failure_mode",
     "file",
     "line",
+    "relevant_code",
+    "failure_mode",
+    "reproduction",
     "evidence",
     "minimal_fix",
     "scope",
@@ -189,19 +206,25 @@ def _inconclusive(
     reason: str, head: str = "", base: str = "", merge_base: str = ""
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "verdict": "INCONCLUSIVE",
         "inconclusive_reason": reason,
         "reviewed_head_sha": head,
         "reviewed_base_sha": base,
         "reviewed_merge_base_sha": merge_base,
         "summary": reason,
+        "plan_provided": False,
         "findings": [],
         "acceptance_criteria": [],
         "acceptance_criteria_sources": [],
         "no_explicit_criteria_reason": None,
+        "architecture_summary": "Architecture review did not complete reliably.",
         "security_categories_checked": [],
         "security_summary": "Security review did not complete reliably.",
+        "defect_checklist": {
+            item: {"checked": False, "defect_found": False, "evidence": reason}
+            for item in DEFECT_CHECKLIST_ITEMS
+        },
     }
 
 
@@ -255,9 +278,9 @@ def _validate_review(
     if (
         not isinstance(review["schema_version"], int)
         or isinstance(review["schema_version"], bool)
-        or review["schema_version"] != 1
+        or review["schema_version"] != SCHEMA_VERSION
     ):
-        raise ReviewError("schema_version must be 1")
+        raise ReviewError(f"schema_version must be {SCHEMA_VERSION}")
     verdict = _require_string(review["verdict"], "verdict")
     if verdict not in VERDICTS:
         raise ReviewError(f"Unknown verdict: {verdict}")
@@ -294,6 +317,10 @@ def _validate_review(
 
     _require_string(review["summary"], "summary")
     _require_string(review["security_summary"], "security_summary")
+    _require_string(review["architecture_summary"], "architecture_summary")
+    plan_provided = review["plan_provided"]
+    if not isinstance(plan_provided, bool):
+        raise ReviewError("plan_provided must be boolean")
 
     findings = review["findings"]
     if not isinstance(findings, list):
@@ -324,8 +351,17 @@ def _validate_review(
             raise ReviewError(f"{prefix}.category is invalid: {category}")
         if severity not in SEVERITIES:
             raise ReviewError(f"{prefix}.severity is invalid: {severity}")
-        for field in ("title", "failure_mode", "evidence", "minimal_fix"):
+        for field in (
+            "title",
+            "relevant_code",
+            "failure_mode",
+            "reproduction",
+            "evidence",
+            "minimal_fix",
+        ):
             _require_string(finding.get(field), f"{prefix}.{field}")
+        if category == "ARCH" and not plan_provided:
+            raise ReviewError(f"{prefix} ARCH findings require plan_provided=true")
         file_value = finding.get("file")
         if file_value is not None and not isinstance(file_value, str):
             raise ReviewError(f"{prefix}.file must be a string or null")
@@ -355,11 +391,11 @@ def _validate_review(
             raise ReviewError(f"{prefix} requires adjacent_justification")
         if (
             scope == "ADJACENT"
-            and severity in {"P1", "P2"}
-            and category not in {"AC", "SECURITY"}
+            and severity in BLOCKING_SEVERITIES
+            and category not in CARVE_OUT_CATEGORIES
         ):
             raise ReviewError(
-                f"{prefix} only blocking AC/security findings may compel adjacent-file edits"
+                f"{prefix} only blocking AC/ARCH/security findings may compel adjacent-file edits"
             )
         if scope == "DIFF" and adjacent_justification is not None:
             raise ReviewError(f"{prefix} DIFF scope requires null adjacent_justification")
@@ -370,16 +406,16 @@ def _validate_review(
         if remediation is not None and not isinstance(remediation, str):
             raise ReviewError(f"{prefix}.remediation must be a string or null")
         if broad_or_risky:
-            if category not in {"AC", "SECURITY"} or severity not in {"P1", "P2"}:
+            if category not in CARVE_OUT_CATEGORIES or severity not in BLOCKING_SEVERITIES:
                 raise ReviewError(
-                    f"{prefix} broad/risky fixes are only valid for blocking AC/security findings"
+                    f"{prefix} broad/risky fixes are only valid for blocking AC/ARCH/security findings"
                 )
             if not (remediation or "").strip():
                 raise ReviewError(f"{prefix} broad/risky fix requires remediation")
             broad_blocking_count += 1
         elif remediation is not None:
             raise ReviewError(f"{prefix} non-broad finding requires null remediation")
-        if severity in {"P1", "P2"}:
+        if severity in BLOCKING_SEVERITIES:
             blocking_count += 1
 
     criteria = review["acceptance_criteria"]
@@ -427,14 +463,20 @@ def _validate_review(
             )
         if status in {"PARTIAL", "MISSING"} and severity == "NONE":
             raise ReviewError(f"{prefix} partial/missing criterion requires a severity")
-        if status in {"PARTIAL", "MISSING"} and severity in {"P1", "P2"} and finding_id is None:
+        if (
+            status in {"PARTIAL", "MISSING"}
+            and severity in BLOCKING_SEVERITIES
+            and finding_id is None
+        ):
             raise ReviewError(f"{prefix} blocking criterion requires a linked AC finding")
         if explicit and status in {"PARTIAL", "MISSING"}:
-            if severity not in {"P1", "P2"} or finding_id is None:
+            if severity not in BLOCKING_SEVERITIES or finding_id is None:
                 raise ReviewError(
                     f"{prefix} explicit partial/missing criterion must reference a blocking AC finding"
                 )
-        if status in {"PARTIAL", "MISSING"} and severity in {"P1", "P2"}:
+            if status == "MISSING" and severity != "BLOCKER":
+                raise ReviewError(f"{prefix} explicit MISSING criterion must be BLOCKER")
+        if status in {"PARTIAL", "MISSING"} and severity in BLOCKING_SEVERITIES:
             blocking_count += 1
 
     sources = review["acceptance_criteria_sources"]
@@ -466,8 +508,33 @@ def _validate_review(
             f"missing={missing_security}, unknown={unknown_security}"
         )
 
+    checklist = review["defect_checklist"]
+    if not isinstance(checklist, dict):
+        raise ReviewError("defect_checklist must be an object")
+    missing_items = sorted(set(DEFECT_CHECKLIST_ITEMS) - checklist.keys())
+    unexpected_items = sorted(checklist.keys() - set(DEFECT_CHECKLIST_ITEMS))
+    if missing_items or unexpected_items:
+        raise ReviewError(
+            f"defect_checklist items mismatch; missing={missing_items}, "
+            f"unexpected={unexpected_items}"
+        )
+    for item in DEFECT_CHECKLIST_ITEMS:
+        entry = checklist[item]
+        prefix = f"defect_checklist.{item}"
+        if not isinstance(entry, dict):
+            raise ReviewError(f"{prefix} must be an object")
+        if set(entry.keys()) != CHECKLIST_ITEM_FIELDS:
+            raise ReviewError(f"{prefix} must have exactly checked, defect_found, evidence")
+        if not isinstance(entry["checked"], bool) or not isinstance(entry["defect_found"], bool):
+            raise ReviewError(f"{prefix}.checked and .defect_found must be boolean")
+        _require_string(entry["evidence"], f"{prefix}.evidence")
+        if verdict != "INCONCLUSIVE" and not entry["checked"]:
+            raise ReviewError(f"{prefix} must be checked for a conclusive verdict")
+        if entry["defect_found"] and not entry["checked"]:
+            raise ReviewError(f"{prefix} cannot report a defect without being checked")
+
     if verdict == "APPROVED" and blocking_count:
-        raise ReviewError("APPROVED verdict contains blocking P1/P2 items")
+        raise ReviewError("APPROVED verdict contains blocking BLOCKER/HIGH items")
     if verdict == "CHANGES_REQUESTED" and (not blocking_count or broad_blocking_count):
         raise ReviewError("CHANGES_REQUESTED requires blockers and no broad/risky AC/security fix")
     if verdict == "BLOCKED" and not broad_blocking_count:
@@ -579,14 +646,19 @@ def _self_test() -> int:
                 "provider schema preflight accepted an incompatible fixture"
             )
 
+    checked = {
+        item: {"checked": True, "defect_found": False, "evidence": "Examined; nothing found."}
+        for item in DEFECT_CHECKLIST_ITEMS
+    }
     sample = {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "verdict": "APPROVED",
         "inconclusive_reason": None,
         "reviewed_head_sha": "a" * 40,
         "reviewed_base_sha": "b" * 40,
         "reviewed_merge_base_sha": "c" * 40,
         "summary": "All gates passed.",
+        "plan_provided": True,
         "findings": [],
         "acceptance_criteria": [
             {
@@ -602,8 +674,10 @@ def _self_test() -> int:
         ],
         "acceptance_criteria_sources": ["Issue #1"],
         "no_explicit_criteria_reason": None,
+        "architecture_summary": "Diff follows the plan; weakest assumption confirmed.",
         "security_categories_checked": sorted(SECURITY_CATEGORIES),
         "security_summary": "No blocking security issue found.",
+        "defect_checklist": checked,
     }
     envelope = {
         "type": "result",
@@ -617,31 +691,95 @@ def _self_test() -> int:
     if validated["verdict"] != "APPROVED":
         raise AssertionError("self-test verdict mismatch")
 
+    finding = {
+        "id": "correctness-1",
+        "category": "CORRECTNESS",
+        "severity": "HIGH",
+        "title": "Broken path",
+        "file": "app.py",
+        "line": 10,
+        "relevant_code": "value = payload['key']",
+        "failure_mode": "A common request raises KeyError.",
+        "reproduction": "POST /items without 'key' -> 500",
+        "evidence": "app.py:10",
+        "minimal_fix": "Use payload.get('key') and validate.",
+        "scope": "DIFF",
+        "adjacent_justification": None,
+        "broad_or_risky_fix": False,
+        "remediation": None,
+    }
     invalid = dict(sample)
-    invalid["findings"] = [
-        {
-            "id": "correctness-1",
-            "category": "CORRECTNESS",
-            "severity": "P2",
-            "title": "Broken path",
-            "failure_mode": "A common request raises an exception.",
-            "file": "app.py",
-            "line": 10,
-            "evidence": "A common request raises an exception.",
-            "minimal_fix": "Handle the missing value.",
-            "scope": "DIFF",
-            "adjacent_justification": None,
-            "broad_or_risky_fix": False,
-            "remediation": None,
-        }
-    ]
+    invalid["findings"] = [finding]
     try:
         _validate_review(invalid)
     except ReviewError:
         pass
     else:
-        raise AssertionError("self-test accepted APPROVED with a P2 finding")
-    print(json.dumps({"ok": True, "tests": 6}))
+        raise AssertionError("self-test accepted APPROVED with a HIGH finding")
+    changes = dict(sample)
+    changes["verdict"] = "CHANGES_REQUESTED"
+    changes["findings"] = [finding]
+    if _validate_review(changes)["verdict"] != "CHANGES_REQUESTED":
+        raise AssertionError("self-test rejected a valid CHANGES_REQUESTED review")
+    medium_only = dict(sample)
+    medium_only["findings"] = [dict(finding, severity="MEDIUM")]
+    if _validate_review(medium_only)["verdict"] != "APPROVED":
+        raise AssertionError("self-test rejected APPROVED with only a MEDIUM finding")
+    no_repro = dict(changes)
+    no_repro["findings"] = [dict(finding, reproduction="")]
+    try:
+        _validate_review(no_repro)
+    except ReviewError:
+        pass
+    else:
+        raise AssertionError("self-test accepted a finding without reproduction")
+    arch_without_plan = dict(changes)
+    arch_without_plan["plan_provided"] = False
+    arch_without_plan["findings"] = [dict(finding, category="ARCH")]
+    try:
+        _validate_review(arch_without_plan)
+    except ReviewError:
+        pass
+    else:
+        raise AssertionError("self-test accepted an ARCH finding without a plan")
+    unchecked = dict(sample)
+    unchecked["defect_checklist"] = dict(
+        checked,
+        missing_tests={"checked": False, "defect_found": False, "evidence": "skipped"},
+    )
+    try:
+        _validate_review(unchecked)
+    except ReviewError:
+        pass
+    else:
+        raise AssertionError("self-test accepted an unchecked defect-checklist item")
+    partial_missing = dict(changes)
+    partial_missing["findings"] = [
+        dict(finding, id="ac-1-gap", category="AC", severity="HIGH")
+    ]
+    partial_missing["acceptance_criteria"] = [
+        dict(
+            sample["acceptance_criteria"][0],
+            status="MISSING",
+            severity="HIGH",
+            finding_id="ac-1-gap",
+        )
+    ]
+    try:
+        _validate_review(partial_missing)
+    except ReviewError:
+        pass
+    else:
+        raise AssertionError("self-test accepted an explicit MISSING criterion below BLOCKER")
+    legacy = dict(sample)
+    legacy["schema_version"] = 1
+    try:
+        _validate_review(legacy)
+    except ReviewError:
+        pass
+    else:
+        raise AssertionError("self-test accepted a schema_version 1 review")
+    print(json.dumps({"ok": True, "tests": 13}))
     return 0
 
 

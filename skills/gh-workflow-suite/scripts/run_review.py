@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Run a structured review with Claude first and a Codex fallback."""
+"""Run a structured review through a primary provider with a sticky fallback.
+
+Default routing (Astra / Fable / Astra): a fresh read-only Codex process is the
+primary reviewer of code written by the Claude implementer; Claude read-only is
+the fallback. Plan gates may select Claude as primary with --primary claude.
+"""
 
 from __future__ import annotations
 
@@ -28,19 +33,20 @@ import run_claude_review as claude_adapter
 CLASSIFIER_VERSION = 1
 FALLBACK_FAILED_EXIT = 6
 SNAPSHOT_MISMATCH_EXIT = 7
-MAX_CODEX_GENERATIONS_PER_GATE = 2
+MAX_CODEX_GENERATIONS_PER_GATE = 2  # generations per fallback session (initial + one repair)
 VALID_REVIEW_EXITS = set(claude_adapter.VERDICT_EXIT_CODES.values())
 QUOTA_MACHINE_CODES = {"usage_cap_reached", "credit_balance_low"}
+PROVIDERS = ("codex", "claude")
+PROVIDER_STATE_VERSION = 3
 PROVIDER_STATE_FIELDS = {
     "schema_version",
     "state_id",
-    "active_provider",
-    "fallback_trigger",
+    "routing",
+    "fallbacks",
     "quota_classifier_version",
-    "quota_classification",
-    "claude_diagnostic_sha256",
-    "codex_attempted_gates",
+    "fallback_attempted_gates",
 }
+FALLBACK_RECORD_FIELDS = {"trigger", "quota_classification", "diagnostic_sha256"}
 GATE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 ANSI_ESCAPE_RE = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 QUOTA_MESSAGE_PATTERNS = (
@@ -105,12 +111,14 @@ VALID_QUOTA_CLASSIFICATIONS = {
     *(f"MACHINE_{code.upper()}" for code in QUOTA_MACHINE_CODES),
     *(f"MESSAGE_{identifier}" for identifier, _pattern in QUOTA_MESSAGE_PATTERNS),
 }
+TRIGGER_KINDS = ("QUOTA_EXHAUSTED", "REVIEW_FAILED", "REVIEW_INCONCLUSIVE", "REVIEW_INVALID")
 VALID_FALLBACK_TRIGGERS = {
-    "CLAUDE_QUOTA_EXHAUSTED",
-    "CLAUDE_REVIEW_FAILED",
-    "CLAUDE_REVIEW_INCONCLUSIVE",
-    "CLAUDE_REVIEW_INVALID",
+    f"{provider.upper()}_{kind}" for provider in PROVIDERS for kind in TRIGGER_KINDS
 }
+
+
+def _other_provider(provider: str) -> str:
+    return "claude" if provider == "codex" else "codex"
 WEB_FEATURES = (
     "web_search_request",
     "web_search_cached",
@@ -132,17 +140,22 @@ class SnapshotError(WrapperError):
 
 def _review_output_contract() -> str:
     security_categories = ", ".join(sorted(claude_adapter.SECURITY_CATEGORIES))
+    checklist_items = ", ".join(claude_adapter.DEFECT_CHECKLIST_ITEMS)
     return f"""BEGIN GATEWAY OUTPUT CONTRACT
 The JSON schema describes field shapes. These semantic invariants are also mandatory:
 - Copy reviewed_head_sha, reviewed_base_sha, and reviewed_merge_base_sha exactly.
 - For APPROVED, CHANGES_REQUESTED, or BLOCKED, acceptance_criteria_sources must be non-empty.
 - If no explicit criterion exists, set a non-empty no_explicit_criteria_reason.
-- Every explicit PARTIAL or MISSING criterion must be P1/P2 and link to a matching AC finding.
+- Severity is BLOCKER / HIGH / MEDIUM / LOW. Only BLOCKER and HIGH block.
+- Every explicit MISSING criterion must be BLOCKER; every explicit PARTIAL criterion must be HIGH or BLOCKER; both must link to a matching AC finding.
+- Every finding must carry non-empty relevant_code (quoted verbatim), failure_mode (why), reproduction (concrete scenario), evidence, and minimal_fix (proposed correction). You never apply the correction.
+- ARCH findings are valid only when plan_provided is true. Set plan_provided from the evidence (plan.md present or not) and write architecture_summary either way.
+- defect_checklist must have all six items checked=true with evidence for every conclusive verdict: {checklist_items}. A defect found under an item is a finding; name its id in that item's evidence.
 - For every conclusive verdict, security_categories_checked must contain each of these exactly once:
   {security_categories}
-- APPROVED permits no P1/P2 blocker.
-- CHANGES_REQUESTED requires at least one P1/P2 blocker and no broad/risky AC or security repair.
-- BLOCKED requires a broad/risky P1/P2 AC or security repair with remediation.
+- APPROVED permits no BLOCKER/HIGH finding.
+- CHANGES_REQUESTED requires at least one BLOCKER/HIGH finding and no broad/risky AC, ARCH, or security repair.
+- BLOCKED requires a broad/risky BLOCKER/HIGH AC, ARCH, or security repair with remediation.
 - INCONCLUSIVE requires a non-empty inconclusive_reason; use it when required checks cannot complete.
 - Finding file paths must be normalized repository-relative paths, never absolute paths.
 Before returning, self-check the final object against every rule above. Output one final object only.
@@ -687,15 +700,34 @@ def _preflight_private_artifact_paths(args: argparse.Namespace) -> None:
 
 def _new_provider_state() -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": PROVIDER_STATE_VERSION,
         "state_id": secrets.token_hex(16),
-        "active_provider": "claude",
-        "fallback_trigger": None,
+        "routing": {provider: provider for provider in PROVIDERS},
+        "fallbacks": {provider: None for provider in PROVIDERS},
         "quota_classifier_version": CLASSIFIER_VERSION,
-        "quota_classification": None,
-        "claude_diagnostic_sha256": None,
-        "codex_attempted_gates": {},
+        "fallback_attempted_gates": {},
     }
+
+
+def _validate_fallback_record(primary: str, record: Any) -> None:
+    if not isinstance(record, dict):
+        raise WrapperError(f"provider state fallback record for {primary} must be an object")
+    if set(record.keys()) != FALLBACK_RECORD_FIELDS:
+        raise WrapperError(f"provider state fallback record for {primary} has wrong fields")
+    trigger = record["trigger"]
+    if trigger not in VALID_FALLBACK_TRIGGERS or not trigger.startswith(primary.upper() + "_"):
+        raise WrapperError(f"provider state for {primary} lacks a valid fallback trigger")
+    classification = record["quota_classification"]
+    if trigger.endswith("QUOTA_EXHAUSTED"):
+        if classification not in VALID_QUOTA_CLASSIFICATIONS:
+            raise WrapperError(f"provider state for {primary} lacks a quota classification")
+    elif classification is not None:
+        raise WrapperError(
+            f"non-quota fallback record for {primary} cannot contain a quota classification"
+        )
+    diagnostic_hash = record["diagnostic_sha256"]
+    if not isinstance(diagnostic_hash, str) or re.fullmatch(r"[0-9a-f]{64}", diagnostic_hash) is None:
+        raise WrapperError(f"provider state for {primary} lacks a diagnostic hash")
 
 
 def _validate_provider_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -708,57 +740,48 @@ def _validate_provider_state(state: dict[str, Any]) -> dict[str, Any]:
     if (
         not isinstance(state["schema_version"], int)
         or isinstance(state["schema_version"], bool)
-        or state["schema_version"] != 2
+        or state["schema_version"] != PROVIDER_STATE_VERSION
     ):
-        raise WrapperError("provider state schema_version must be 2")
+        raise WrapperError(f"provider state schema_version must be {PROVIDER_STATE_VERSION}")
     state_id = state["state_id"]
     if not isinstance(state_id, str) or re.fullmatch(r"[0-9a-f]{32}", state_id) is None:
         raise WrapperError("provider state state_id is invalid")
-    active = state["active_provider"]
-    if active not in {"claude", "codex"}:
-        raise WrapperError("provider state active_provider must be claude or codex")
     if (
         not isinstance(state["quota_classifier_version"], int)
         or isinstance(state["quota_classifier_version"], bool)
         or state["quota_classifier_version"] != CLASSIFIER_VERSION
     ):
         raise WrapperError("provider state quota classifier version is incompatible")
-    trigger = state["fallback_trigger"]
-    classification = state["quota_classification"]
-    diagnostic_hash = state["claude_diagnostic_sha256"]
-    codex_attempted_gates = state["codex_attempted_gates"]
-    if not isinstance(codex_attempted_gates, dict):
-        raise WrapperError("provider state codex_attempted_gates must be an object")
-    for gate_id, attempt_id in codex_attempted_gates.items():
+    routing = state["routing"]
+    fallbacks = state["fallbacks"]
+    if not isinstance(routing, dict) or set(routing.keys()) != set(PROVIDERS):
+        raise WrapperError("provider state routing must map every provider")
+    if not isinstance(fallbacks, dict) or set(fallbacks.keys()) != set(PROVIDERS):
+        raise WrapperError("provider state fallbacks must map every provider")
+    for primary in PROVIDERS:
+        target = routing[primary]
+        if target not in PROVIDERS:
+            raise WrapperError(f"provider state routes {primary} to an unknown provider")
+        if target == primary:
+            if fallbacks[primary] is not None:
+                raise WrapperError(f"provider {primary} routes to itself but has fallback metadata")
+        else:
+            if target != _other_provider(primary):
+                raise WrapperError(f"provider {primary} routes to an invalid fallback")
+            _validate_fallback_record(primary, fallbacks[primary])
+    attempted = state["fallback_attempted_gates"]
+    if not isinstance(attempted, dict):
+        raise WrapperError("provider state fallback_attempted_gates must be an object")
+    for gate_id, attempt_id in attempted.items():
         if not isinstance(gate_id, str) or GATE_ID_RE.fullmatch(gate_id) is None:
-            raise WrapperError("provider state contains an invalid Codex gate ID")
+            raise WrapperError("provider state contains an invalid fallback gate ID")
         if (
             not isinstance(attempt_id, str)
             or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
         ):
-            raise WrapperError("provider state contains an invalid Codex attempt ID")
-    if active == "claude" and (
-        trigger is not None
-        or classification is not None
-        or diagnostic_hash is not None
-        or codex_attempted_gates
-    ):
-        raise WrapperError("Claude provider state cannot contain fallback metadata")
-    if active == "codex":
-        if trigger not in VALID_FALLBACK_TRIGGERS:
-            raise WrapperError("Codex provider state lacks a valid fallback trigger")
-        if trigger == "CLAUDE_QUOTA_EXHAUSTED":
-            if classification not in VALID_QUOTA_CLASSIFICATIONS:
-                raise WrapperError("Codex provider state lacks a quota classification")
-        elif classification is not None:
-            raise WrapperError(
-                "Non-quota Codex provider state cannot contain a quota classification"
-            )
-        if (
-            not isinstance(diagnostic_hash, str)
-            or re.fullmatch(r"[0-9a-f]{64}", diagnostic_hash) is None
-        ):
-            raise WrapperError("Codex provider state lacks a diagnostic hash")
+            raise WrapperError("provider state contains an invalid fallback attempt ID")
+    if attempted and all(routing[p] == p for p in PROVIDERS):
+        raise WrapperError("provider state has consumed fallback gates without any fallback")
     return state
 
 
@@ -1021,10 +1044,10 @@ def _run_codex(
     )
 
 
-def _write_codex_repair_prompt(
+def _write_repair_prompt(
     original_prompt: Path, destination: Path, validation_error: str
 ) -> Path:
-    original = _safe_regular_bytes(original_prompt, "original Codex review prompt")
+    original = _safe_regular_bytes(original_prompt, "original review prompt")
     diagnostic = validation_error.strip()[:2_000]
     repair = (
         b"\n\nBEGIN STRUCTURED OUTPUT REPAIR\n"
@@ -1038,7 +1061,7 @@ def _write_codex_repair_prompt(
     )
     combined = original + repair
     if len(combined) > claude_adapter.MAX_PROMPT_BYTES:
-        raise SnapshotError("Codex repair prompt exceeds the adapter size limit")
+        raise SnapshotError("repair prompt exceeds the adapter size limit")
     _write_private_bytes(destination, combined)
     return destination
 
@@ -1153,12 +1176,16 @@ def _finish(
     classification: str | None,
     selected_from_state: bool,
 ) -> int:
+    vendor = provider.split("_", 1)[0]
+    primary = args.primary
+    fallback_record = provider_state["fallbacks"].get(primary) or {}
     review_bytes = _write_private_json(args.output, review)
     trace = {
-        "schema_version": 2,
+        "schema_version": 3,
         "gate_id": args.gate_id,
         "provider_state_id": provider_state["state_id"],
-        "codex_attempt_id": provider_state["codex_attempted_gates"].get(args.gate_id),
+        "primary_provider": primary,
+        "fallback_attempt_id": provider_state["fallback_attempted_gates"].get(args.gate_id),
         "attempts": [attempt.trace_record() for attempt in attempts],
     }
     trace_bytes = _write_private_json(args.trace_output, trace)
@@ -1167,25 +1194,25 @@ def _finish(
     state_bytes = _json_bytes(provider_state)
     prompt_bytes = args.prompt.read_bytes()
     schema_bytes = args.schema.read_bytes()
+    binary_name = args.codex_bin if vendor == "codex" else args.claude_bin
     metadata = {
-        "schema_version": 1,
+        "schema_version": 2,
         "gate_id": args.gate_id,
         "review_provider": provider,
-        "provider_binary": shutil.which(
-            args.codex_bin if provider == "codex_fallback" else args.claude_bin
-        ),
-        "provider_version": _provider_version(
-            args.codex_bin if provider == "codex_fallback" else args.claude_bin
-        ),
+        "reviewer_vendor": vendor,
+        "primary_provider": primary,
+        "writer_vendor": args.writer,
+        "provider_binary": shutil.which(binary_name),
+        "provider_version": _provider_version(binary_name),
         "provider_state_id": provider_state["state_id"],
-        "codex_attempt_id": provider_state["codex_attempted_gates"].get(args.gate_id),
+        "fallback_attempt_id": provider_state["fallback_attempted_gates"].get(args.gate_id),
         "provider_selected_from_state": selected_from_state,
-        "fallback_used": provider == "codex_fallback",
-        "fallback_trigger": provider_state["fallback_trigger"],
+        "fallback_used": provider.endswith("_fallback"),
+        "fallback_trigger": fallback_record.get("trigger"),
         "quota_classifier_version": CLASSIFIER_VERSION,
-        "quota_classification": provider_state["quota_classification"],
-        "claude_diagnostic_sha256": provider_state["claude_diagnostic_sha256"],
-        "independent_vendor_review": provider == "claude",
+        "quota_classification": fallback_record.get("quota_classification"),
+        "primary_diagnostic_sha256": fallback_record.get("diagnostic_sha256"),
+        "independent_vendor_review": vendor != args.writer,
         "attempt_count": len(attempts),
         "exit_code": exit_code,
         "verdict": review["verdict"],
@@ -1464,32 +1491,47 @@ def _self_test() -> int:
             raise AssertionError("index visibility validation accepted a hidden file")
     provider_state = _new_provider_state()
     _validate_provider_state(provider_state)
-    provider_state.update(
-        {
-            "active_provider": "codex",
-            "fallback_trigger": "CLAUDE_QUOTA_EXHAUSTED",
-            "quota_classification": "MACHINE_USAGE_CAP_REACHED",
-            "claude_diagnostic_sha256": "d" * 64,
-            "codex_attempted_gates": {"full-review-01": "e" * 32},
-        }
-    )
+    provider_state["routing"]["claude"] = "codex"
+    provider_state["fallbacks"]["claude"] = {
+        "trigger": "CLAUDE_QUOTA_EXHAUSTED",
+        "quota_classification": "MACHINE_USAGE_CAP_REACHED",
+        "diagnostic_sha256": "d" * 64,
+    }
+    provider_state["fallback_attempted_gates"] = {"full-review-01": "e" * 32}
     _validate_provider_state(provider_state)
     generic_provider_state = _new_provider_state()
-    generic_provider_state.update(
-        {
-            "active_provider": "codex",
-            "fallback_trigger": "CLAUDE_REVIEW_FAILED",
-            "claude_diagnostic_sha256": "d" * 64,
-        }
-    )
+    generic_provider_state["routing"]["codex"] = "claude"
+    generic_provider_state["fallbacks"]["codex"] = {
+        "trigger": "CODEX_REVIEW_FAILED",
+        "quota_classification": None,
+        "diagnostic_sha256": "d" * 64,
+    }
     _validate_provider_state(generic_provider_state)
-    provider_state["codex_attempted_gates"] = {"invalid gate": "e" * 32}
+    for broken in (
+        {"routing": {"codex": "codex", "claude": "codex"}},  # fallback without record
+        {"fallback_attempted_gates": {"invalid gate": "e" * 32}},
+    ):
+        candidate = _new_provider_state()
+        candidate.update(broken)
+        try:
+            _validate_provider_state(candidate)
+        except WrapperError:
+            pass
+        else:
+            raise AssertionError(f"provider state accepted an invalid fixture: {broken}")
+    mismatched = _new_provider_state()
+    mismatched["routing"]["codex"] = "claude"
+    mismatched["fallbacks"]["codex"] = {
+        "trigger": "CLAUDE_REVIEW_FAILED",  # wrong primary prefix
+        "quota_classification": None,
+        "diagnostic_sha256": "d" * 64,
+    }
     try:
-        _validate_provider_state(provider_state)
+        _validate_provider_state(mismatched)
     except WrapperError:
         pass
     else:
-        raise AssertionError("provider state accepted an invalid gate ID")
+        raise AssertionError("provider state accepted a trigger for the wrong primary")
     with (
         tempfile.TemporaryDirectory(prefix="review-self-source-") as source_name,
         tempfile.TemporaryDirectory(prefix="review-self-frozen-") as frozen_name,
@@ -1522,7 +1564,7 @@ def _self_test() -> int:
                     "frozen prompt omitted the semantic output contract"
                 )
             repair_path = source_root / "repair-prompt.txt"
-            _write_codex_repair_prompt(
+            _write_repair_prompt(
                 frozen.prompt,
                 repair_path,
                 "security_categories_checked mismatch",
@@ -1547,13 +1589,13 @@ def _self_test() -> int:
             pass
         else:
             raise AssertionError("context fingerprint accepted a symbolic link")
-    print(json.dumps({"ok": True, "tests": 28}))
+    print(json.dumps({"ok": True, "tests": 31}))
     return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run Claude review with a sticky Codex fallback."
+        description="Run a structured review: primary provider with a sticky fallback."
     )
     parser.add_argument("--check", action="store_true", help="Check both reviewer CLIs")
     parser.add_argument(
@@ -1586,6 +1628,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
+    parser.add_argument(
+        "--primary",
+        choices=PROVIDERS,
+        default=os.environ.get("REVIEW_PRIMARY_PROVIDER", "codex"),
+        help="Reviewer tried first for this gate; the other provider is the sticky fallback",
+    )
+    parser.add_argument(
+        "--writer",
+        choices=PROVIDERS,
+        default=os.environ.get("REVIEW_WRITER_PROVIDER", "claude"),
+        help="Vendor that wrote the reviewed code; used only for provenance",
+    )
     parser.add_argument(
         "--codex-model", default=os.environ.get("CODEX_REVIEW_MODEL", "")
     )
@@ -1759,11 +1813,15 @@ def main() -> int:
     attempts: list[Attempt] = []
     classification: str | None = None
     selected_from_state = False
+    primary = args.primary
+    fallback = _other_provider(primary)
     try:
         with _locked_provider_state(args.provider_state) as provider_state:
-            selected_from_state = provider_state["active_provider"] == "codex"
+            selected_from_state = provider_state["routing"][primary] != primary
             if selected_from_state:
-                classification = provider_state["quota_classification"]
+                classification = (provider_state["fallbacks"][primary] or {}).get(
+                    "quota_classification"
+                )
             with tempfile.TemporaryDirectory(prefix="gh-review-frozen-") as frozen_name:
                 frozen_root = Path(frozen_name).resolve()
                 os.chmod(frozen_root, 0o700)
@@ -1774,7 +1832,7 @@ def main() -> int:
                     try:
                         git_snapshot = _capture_git_snapshot(args)
                     except SnapshotError as exc:
-                        provider = "codex_fallback" if selected_from_state else "claude"
+                        provider = f"{fallback}_fallback" if selected_from_state else primary
                         return _finish(
                             args=review_args,
                             review=_inconclusive(review_args, str(exc)),
@@ -1805,36 +1863,70 @@ def main() -> int:
                             selected_from_state=selected_from_state,
                         )
 
-                    if provider_state["active_provider"] == "claude":
-                        with _provider_scratch(
-                            "gh-review-claude-", frozen_root, args.context_dir
-                        ) as claude_scratch:
-                            claude_attempt = _run_claude(
-                                review_args,
-                                claude_scratch / "claude-raw.json",
-                                claude_scratch / "claude-stderr.log",
-                                claude_scratch / "claude-review.json",
+                    def run_provider(
+                        name: str, scratch: Path, prompt: Path, generation: int
+                    ) -> Attempt:
+                        if name == "claude":
+                            claude_args = argparse.Namespace(**vars(review_args))
+                            claude_args.prompt = prompt
+                            return _run_claude(
+                                claude_args,
+                                scratch / f"claude-raw-{generation}.json",
+                                scratch / f"claude-stderr-{generation}.log",
+                                scratch / f"claude-review-{generation}.json",
                             )
-                        attempts.append(claude_attempt)
+                        return _run_codex(
+                            binary_name=args.codex_bin,
+                            cwd=args.cwd,
+                            prompt=prompt,
+                            schema=review_args.schema,
+                            result_path=scratch / f"codex-review-{generation}.json",
+                            model=args.codex_model,
+                            timeout=args.timeout,
+                        )
+
+                    def attempt_failed(attempt: Attempt) -> str | None:
+                        """Return a failure reason, or None when a result is present."""
+                        if attempt.provider == "claude":
+                            if attempt.exit_code in VALID_REVIEW_EXITS:
+                                return None
+                            return f"Claude exited with status {attempt.exit_code}"
+                        if attempt.timed_out:
+                            return f"Codex timed out after {args.timeout}s"
+                        if attempt.exit_code != 0:
+                            return f"Codex exited with status {attempt.exit_code}"
+                        if not attempt.result:
+                            return "Codex returned no final review"
+                        return None
+
+                    if not selected_from_state:
+                        with _provider_scratch(
+                            f"gh-review-{primary}-", frozen_root, args.context_dir
+                        ) as primary_scratch:
+                            primary_attempt = run_provider(
+                                primary, primary_scratch, review_args.prompt, 1
+                            )
+                        attempts.append(primary_attempt)
                         try:
                             _assert_review_snapshot(
                                 args, git_snapshot, frozen_root, frozen
                             )
                         except SnapshotError as exc:
-                            return reject_snapshot_change(exc, "claude")
-                        fallback_trigger: str | None = None
+                            return reject_snapshot_change(exc, primary)
+                        trigger_kind: str | None = None
                         diagnostic_hash: str | None = None
-                        if claude_attempt.exit_code in VALID_REVIEW_EXITS:
+                        failure = attempt_failed(primary_attempt)
+                        if failure is None:
                             try:
                                 review = _validated_review(
-                                    claude_attempt.result, review_args
+                                    primary_attempt.result, review_args
                                 )
                             except claude_adapter.ReviewError as exc:
-                                fallback_trigger = "CLAUDE_REVIEW_INVALID"
+                                trigger_kind = "REVIEW_INVALID"
                                 diagnostic_hash = _sha256(
-                                    claude_attempt.stdout
+                                    primary_attempt.stdout
                                     + b"\x00"
-                                    + claude_attempt.stderr
+                                    + primary_attempt.stderr
                                     + b"\x00"
                                     + str(exc).encode("utf-8", errors="replace")
                                 )
@@ -1844,7 +1936,7 @@ def main() -> int:
                                         args, git_snapshot, frozen_root, frozen
                                     )
                                 except SnapshotError as exc:
-                                    return reject_snapshot_change(exc, "claude")
+                                    return reject_snapshot_change(exc, primary)
                                 if review["verdict"] != "INCONCLUSIVE":
                                     return _finish(
                                         args=review_args,
@@ -1852,123 +1944,103 @@ def main() -> int:
                                         exit_code=claude_adapter.VERDICT_EXIT_CODES[
                                             review["verdict"]
                                         ],
-                                        provider="claude",
+                                        provider=primary,
                                         provider_state=provider_state,
                                         attempts=attempts,
                                         classification=None,
                                         selected_from_state=False,
                                     )
-                                fallback_trigger = "CLAUDE_REVIEW_INCONCLUSIVE"
+                                trigger_kind = "REVIEW_INCONCLUSIVE"
                                 diagnostic_hash = _sha256(
-                                    claude_attempt.stdout
+                                    primary_attempt.stdout
                                     + b"\x00"
-                                    + claude_attempt.stderr
+                                    + primary_attempt.stderr
                                 )
                         else:
                             classification, diagnostic_hash = _classify_quota(
-                                claude_attempt.exit_code,
-                                claude_attempt.stdout,
-                                claude_attempt.stderr,
+                                primary_attempt.exit_code,
+                                primary_attempt.stdout,
+                                primary_attempt.stderr,
                             )
-                            fallback_trigger = (
-                                "CLAUDE_QUOTA_EXHAUSTED"
+                            trigger_kind = (
+                                "QUOTA_EXHAUSTED"
                                 if classification is not None
-                                else "CLAUDE_REVIEW_FAILED"
+                                else "REVIEW_FAILED"
                             )
                         try:
                             _assert_review_snapshot(
                                 args, git_snapshot, frozen_root, frozen
                             )
                         except SnapshotError as exc:
-                            return reject_snapshot_change(exc, "claude")
-                        if fallback_trigger is None or diagnostic_hash is None:
+                            return reject_snapshot_change(exc, primary)
+                        if trigger_kind is None or diagnostic_hash is None:
                             raise WrapperError(
-                                "Claude fallback decision lacked durable provenance"
+                                "fallback decision lacked durable provenance"
                             )
-                        provider_state.update(
-                            {
-                                "active_provider": "codex",
-                                "fallback_trigger": fallback_trigger,
-                                "quota_classification": classification,
-                                "claude_diagnostic_sha256": diagnostic_hash,
-                            }
-                        )
+                        provider_state["routing"][primary] = fallback
+                        provider_state["fallbacks"][primary] = {
+                            "trigger": f"{primary.upper()}_{trigger_kind}",
+                            "quota_classification": classification,
+                            "diagnostic_sha256": diagnostic_hash,
+                        }
                         _write_private_json(args.provider_state, provider_state)
 
-                    prior_codex_attempt = provider_state["codex_attempted_gates"].get(
+                    fallback_provider = f"{fallback}_fallback"
+                    prior_attempt = provider_state["fallback_attempted_gates"].get(
                         args.gate_id
                     )
-                    if prior_codex_attempt is not None:
+                    if prior_attempt is not None:
                         review = _inconclusive(
                             review_args,
-                            "Codex fallback was already consumed for gate "
+                            f"{fallback} fallback was already consumed for gate "
                             f"{args.gate_id!r}; refusing a retry",
                         )
                         return _finish(
                             args=review_args,
                             review=review,
                             exit_code=FALLBACK_FAILED_EXIT,
-                            provider="codex_fallback",
+                            provider=fallback_provider,
                             provider_state=provider_state,
                             attempts=attempts,
                             classification=classification,
                             selected_from_state=selected_from_state,
                         )
-                    provider_state["codex_attempted_gates"][args.gate_id] = (
+                    provider_state["fallback_attempted_gates"][args.gate_id] = (
                         secrets.token_hex(16)
                     )
                     _write_private_json(args.provider_state, provider_state)
 
-                    reason = "Codex fallback did not complete"
+                    reason = f"{fallback} fallback did not complete"
                     with _provider_scratch(
-                        "gh-review-codex-", frozen_root, args.context_dir
-                    ) as codex_scratch:
-                        codex_prompt = review_args.prompt
+                        f"gh-review-{fallback}-fallback-", frozen_root, args.context_dir
+                    ) as fallback_scratch:
+                        fallback_prompt = review_args.prompt
                         for generation in range(MAX_CODEX_GENERATIONS_PER_GATE):
-                            codex_attempt = _run_codex(
-                                binary_name=args.codex_bin,
-                                cwd=args.cwd,
-                                prompt=codex_prompt,
-                                schema=review_args.schema,
-                                result_path=(
-                                    codex_scratch
-                                    / f"codex-review-{generation + 1}.json"
-                                ),
-                                model=args.codex_model,
-                                timeout=args.timeout,
+                            fallback_attempt = run_provider(
+                                fallback, fallback_scratch, fallback_prompt, generation + 1
                             )
-                            attempts.append(codex_attempt)
+                            attempts.append(fallback_attempt)
                             try:
                                 _assert_review_snapshot(
                                     args, git_snapshot, frozen_root, frozen
                                 )
                             except SnapshotError as exc:
-                                return reject_snapshot_change(exc, "codex_fallback")
-                            if codex_attempt.timed_out:
-                                reason = (
-                                    f"Codex fallback timed out after {args.timeout}s"
-                                )
-                                break
-                            if codex_attempt.exit_code != 0:
-                                reason = (
-                                    "Codex fallback exited with status "
-                                    f"{codex_attempt.exit_code}"
-                                )
-                                break
-                            if not codex_attempt.result:
-                                reason = "Codex fallback returned no final review"
+                                return reject_snapshot_change(exc, fallback_provider)
+                            failure = attempt_failed(fallback_attempt)
+                            if failure is not None:
+                                reason = f"{fallback} fallback failed: {failure}"
                                 break
                             try:
                                 review = _validated_review(
-                                    codex_attempt.result, review_args
+                                    fallback_attempt.result, review_args
                                 )
                             except claude_adapter.ReviewError as exc:
-                                reason = f"Codex fallback output was invalid: {exc}"
+                                reason = f"{fallback} fallback output was invalid: {exc}"
                                 if generation + 1 >= MAX_CODEX_GENERATIONS_PER_GATE:
                                     break
-                                codex_prompt = _write_codex_repair_prompt(
+                                fallback_prompt = _write_repair_prompt(
                                     review_args.prompt,
-                                    codex_scratch / "codex-repair-prompt.txt",
+                                    fallback_scratch / "repair-prompt.txt",
                                     str(exc),
                                 )
                                 continue
@@ -1977,14 +2049,14 @@ def main() -> int:
                                     args, git_snapshot, frozen_root, frozen
                                 )
                             except SnapshotError as exc:
-                                return reject_snapshot_change(exc, "codex_fallback")
+                                return reject_snapshot_change(exc, fallback_provider)
                             return _finish(
                                 args=review_args,
                                 review=review,
                                 exit_code=claude_adapter.VERDICT_EXIT_CODES[
                                     review["verdict"]
                                 ],
-                                provider="codex_fallback",
+                                provider=fallback_provider,
                                 provider_state=provider_state,
                                 attempts=attempts,
                                 classification=classification,
@@ -1992,13 +2064,13 @@ def main() -> int:
                             )
                     review = _inconclusive(
                         review_args,
-                        f"{reason} after Claude did not produce a usable review verdict",
+                        f"{reason} after {primary} did not produce a usable review verdict",
                     )
                     return _finish(
                         args=review_args,
                         review=review,
                         exit_code=FALLBACK_FAILED_EXIT,
-                        provider="codex_fallback",
+                        provider=fallback_provider,
                         provider_state=provider_state,
                         attempts=attempts,
                         classification=classification,

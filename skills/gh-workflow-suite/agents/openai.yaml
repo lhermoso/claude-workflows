@@ -1,4 +1,4 @@
 interface:
   display_name: "GH Workflow Suite"
-  short_description: "Claude-first reviews with Codex fallback"
+  short_description: "Codex plans, Claude Fable implements, Codex reviews; CI gates merge"
   default_prompt: "Use $gh-workflow-suite to run full-review for a PR, issue-pipeline for an issue, or drain-issues for a backlog."

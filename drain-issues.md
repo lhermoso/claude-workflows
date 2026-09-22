@@ -1,7 +1,7 @@
 ---
 allowed-tools: Bash(git:*), Bash(gh:*), Task
 argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all] [--no-plan-review] [--basic-review] [--no-verify] [--plan-model=M] [--code-model=M] [--review-model=M]
-description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Plans and reviews run on claude-fable-5 (fallback opus), code is written by claude-opus-5. ALL quality gates ON by default: a single Codex plan review before coding, plan-adherence verification after coding, and the Claude↔Codex full-review loop before merge. Opt out with --no-plan-review / --no-verify / --basic-review.
+description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Plans and reviews run on claude-fable-5 (fallback opus), code is written by claude-opus-5. ALL quality gates ON by default: a single Codex plan review before coding, plan-adherence verification after coding, the Claude↔Codex full-review loop (Codex gets requirements + plan + report + diff, four gates, BLOCKER/HIGH/MEDIUM/LOW), and a CI gate — required checks green on the final SHA — before merge. Opt out with --no-plan-review / --no-verify / --basic-review; the CI gate cannot be opted out.
 ---
 
 # Autonomous Issue Drainer
@@ -26,6 +26,7 @@ Arguments: **$ARGUMENTS**
 | `--max-parallel=N` | 2 | Max concurrent subagents (keep low to avoid context overflow) |
 | `--dry-run` | false | Analyze only, don't process |
 | `--no-merge` | false | Review PRs but don't auto-merge |
+| *(CI gate)* | always on | Before any merge, required status checks must be green on the PR's final SHA. `CI_FAILED` → coder fixes and the review loop re-runs; `CI_MISSING` (check never ran — billing, quota, runner) → PR held, never merged. No flag disables this. |
 | `--skip-review` | false | Skip Phase 6 review/merge entirely (PRs left open) |
 | `--basic-review` | false | Use fast basic diff review (~1-2 min per PR) instead of the DEFAULT Claude↔Codex review loop (Codex reviews each PR, Claude fixes issues, repeat until approved, max 15 iterations per PR, ~5-15 min). |
 | `--no-plan-review` | false | Skip the DEFAULT single Codex plan review before coding. Claude writes the plan, Codex reviews it once against real code (diagnosis + fix side-effects), Claude absorbs the findings into the plan, then coding starts — no re-review round. Plan + review written to `.pair/` (gitignored, local to the worktree — never committed). |
@@ -44,7 +45,7 @@ The legacy `--plan-review` / `--full-review` flags are accepted but redundant �
 | Role | Covers | Model | Fallback |
 |------|--------|-------|----------|
 | **Planner** | root-cause investigation, writing and revising `.pair/PLAN.md`, running the single Codex plan review and absorbing its findings | `fable` (claude-fable-5) | `opus` |
-| **Reviewer** | plan-adherence verification + Implementation Report, basic diff review, triaging Codex `[P1]`/`[P2]` findings, merge decisions | `fable` (claude-fable-5) | `opus` |
+| **Reviewer** | plan-adherence verification + Implementation Report, basic diff review, triaging Codex `BLOCKER`/`HIGH` findings, merge decisions | `fable` (claude-fable-5) | `opus` |
 | **Coder** | failing test, implementation, lint/test runs, CHANGELOG, commits, PR creation, applying fixes the reviewer decided to accept | `opus` (claude-opus-5) | — |
 
 Rules:
@@ -56,6 +57,9 @@ Rules:
 5. **Codex is unchanged** — it stays the external adversarial reviewer on its own default model. Never pass `--model` / `-c model=...` to Codex.
 6. **Subagents run Codex in the FOREGROUND.** Any agent launched via `Task` (planner, reviewer, coder) must invoke `codex exec` as a **blocking** call and stay in the same turn until it returns. Never start Codex with `run_in_background` and then end the turn waiting for a task notification — **a subagent is not woken by its own background task**, so the turn simply ends and the agent sits idle until the orchestrator notices (observed: ~20 min lost per planner). If something is backgrounded anyway, poll it with `BashOutput` in a loop **within the same turn** until it exits. Only the main orchestrator loop may background work and rely on being re-invoked.
 7. The dependency/wave analysis in Phases 2–3 is planning work; when it is non-trivial (>10 issues or ambiguous chains), delegate it to a planner agent (`fable`) instead of doing it in the main loop.
+8. **Never invoke `codex exec review` — it DISCARDS findings.** Every Codex call in this workflow, plan review and code review alike, uses plain `codex exec - -s <mode> --ephemeral --json` with the prompt on stdin — `read-only` for the plan review and the improvement passes, `workspace-write` (with a writable `TMPDIR`, per `full-review.md`) for the code review so Codex can run the test suite. Measured on a real drain (COTIntelligence, 8 branches): on one branch the `review` subcommand returned a clean 249-character review *after 7 genuine file reads*, while the **same prompt** through `codex exec -` found two real defects and returned `VERDICT: CHANGES_REQUESTED`; across all eight branches the subcommand never once emitted the VERDICT line. So it is not only the verdict line that is lost — the findings are. **A zero-finding review from `codex exec review` is not evidence that a branch is clean; it is no evidence at all.** If one is ever produced, discard it and re-run through plain `codex exec`.
+9. **The code reviewer receives THREE inputs, every iteration:** (1) original requirements — issue body + comments + PR description; (2) the implementation plan — `<worktree>/.pair/PLAN.md` plus the Implementation Report Phase 5.5 wrote to `<worktree>/.pair/REPORT.md`; (3) the diff (`HEAD` vs `origin/<base>`). `$REVIEW_PROMPT` is **always** the Phase 1 template from `~/.claude/commands/full-review.md`, assembled with those inputs. Never send a bare word or a diff-only prompt — without the plan the reviewer cannot check architecture deviations, without the issue it cannot check requirements. Severity is `BLOCKER` / `HIGH` / `MEDIUM` / `LOW` with axis tags `[CORRECTNESS]` / `[AC]` / `[ARCH]` / `[SECURITY]` / `[CI]`; only BLOCKER and HIGH block. Every finding carries file, relevant code, why, reproduction scenario, proposed correction; Codex proposes, the reviewer triages, the coder applies. Codex never edits. **This is why worktrees survive until Phase 6 finishes** — `.pair/` lives only there.
+10. **CI is a gate, not a report.** Codex LGTM alone never merges a PR. `/full-review` Phase 3.5 waits for the checks on the final SHA and requires every required status context green. `CI_FAILED` → `[BLOCKER][CI]` finding, coder fixes, Codex re-reviews. `CI_MISSING` (a check that never ran — billing, quota, runner, provider) is missing evidence, never a pass: hold the PR with a comment and move on. Local test runs, the coder's or Codex's, never substitute. This workflow never changes branch protection and never uses `--admin` to bypass a failing or missing check.
 
 ---
 
@@ -476,7 +480,7 @@ Then move to the next PR. Reviewer agents never run in parallel with each other,
 
 ### Step 3 — Per-PR Implementation Report
 
-The reviewer agent posts one report per PR (`gh pr comment <pr> --body "<report>"`):
+The reviewer agent posts one report per PR (`gh pr comment <pr> --body "<report>"`) **and writes the same markdown to `<worktree>/.pair/REPORT.md`** (gitignored, never committed) — Phase 6 passes that file to Codex as INPUT 2 of the review prompt:
 
 ```markdown
 ## Implementation Report — PR #<pr> (Issue #<n>)
@@ -508,7 +512,7 @@ PR #46 (Issue #15): PLAN_MET      (4 ✅ · 0 🔀 · 0 ❌ · 0 ➕)
 PR #47 (Issue #22): PLAN_NOT_MET  (3 ✅ · 1 🔀 · 1 ❌ · 2 ➕) → blocked from auto-merge
 ```
 
-Carry each PR's 🔀 and ➕ items into its Phase 6 review prompt — they are the first things the reviewer should scrutinize.
+Each PR's 🔀 and ➕ items reach the Phase 6 reviewer through `.pair/REPORT.md` — they are the first things Codex scrutinizes under the architecture gate.
 
 ---
 
@@ -520,10 +524,14 @@ Carry each PR's 🔀 and ➕ items into its Phase 6 review prompt — they are t
 
 There are two review modes. **Full review is the DEFAULT.** Use basic only if `--basic-review` was passed:
 
-- **Default (full review):** Uses the Claude↔Codex review loop — Codex reviews the PR, a **reviewer agent (`fable`)** triages the findings, a **coder agent (`opus`)** applies the accepted fixes, repeat until Codex approves (max 15 iterations). Thorough (~5-15 min per PR). Codex receives iteration history so it won't re-raise dismissed issues.
-- **`--basic-review` mode:** A **reviewer agent (`fable`)** reviews the diff for breaking changes, regressions, missing changelog, etc. Fast (~1-2 min per PR). Any fixes it asks for are applied by a coder agent (`opus`).
+- **Default (full review):** Uses the Claude↔Codex review loop — Codex reviews the diff against the requirements AND the plan (four gates + defect checklist), a **reviewer agent (`fable`)** triages the BLOCKER/HIGH findings, a **coder agent (`opus`)** applies the accepted corrections, repeat until Codex approves (max 15 iterations), then the CI gate. Thorough (~5-15 min per PR). Codex receives iteration history so it won't re-raise dismissed issues.
+- **`--basic-review` mode:** A **reviewer agent (`fable`)** reviews the diff — plus `.pair/PLAN.md` and `.pair/REPORT.md` — for breaking changes, regressions, unjustified plan deviations, missing changelog, etc. Fast (~1-2 min per PR). Any fixes it asks for are applied by a coder agent (`opus`). The CI gate still applies before merge.
 
-**Verification gate (from Phase 5.5):** a PR marked PLAN_NOT_MET is NEVER auto-merged, regardless of review outcome — review it anyway (the findings are still useful), but leave it open with a comment pointing at the Implementation Report. Include each PR's 🔀 diverged and ➕ unplanned items in the review prompt.
+**Review inputs (both modes):** requirements = issue body + comments + PR body; plan = `<worktree>/.pair/PLAN.md`; report = `<worktree>/.pair/REPORT.md` (fallback: the `## Implementation Report` PR comment); diff = `HEAD` vs `origin/<base>`. If the plan file is missing while the planner ran for that issue, the worktree was removed too early — that is a workflow bug; report it and hold the PR rather than reviewing blind.
+
+**Verification gate (from Phase 5.5):** a PR marked PLAN_NOT_MET is NEVER auto-merged, regardless of review outcome — review it anyway (the findings are still useful), but leave it open with a comment pointing at the Implementation Report.
+
+**CI gate (Rule 10):** nothing merges without `CI_GREEN` on the final SHA.
 
 ### Review Loop
 
@@ -537,33 +545,64 @@ for each PR in [#45, #46, #47]:
      If full review (default):
        Run the full Claude↔Codex review loop for this PR:
 
-       a. Get the PR number
-       b. Execute the /full-review workflow inline, with roles split across separate agents:
-          - Get PR info and checkout the branch
+       a. Get the PR number and its worktree (from the coder JSON)
+       b. Execute `/full-review <PR> --plan=<worktree>/.pair/PLAN.md --report=<worktree>/.pair/REPORT.md`
+          inline, from the worktree, with roles split across separate agents. `full-review.md`
+          is the source of truth for the prompt template, runner, and parser:
+          - Phase 0: PR info, checkout, fetch origin/<base>; build PR_CONTEXT_FILE +
+            ISSUE_CONTEXT_FILE (body AND comments) + PLAN_CONTEXT_FILE + REPORT_CONTEXT_FILE
           - Initialize iteration history
-          - Run Codex review via `codex exec review - --ephemeral --json` with the prompt piped on stdin (including iteration history context on rounds 2+); do NOT use `--full-auto`
+          - Assemble $REVIEW_PROMPT from the full-review.md Phase 1 template: INPUT 1
+            requirements, INPUT 2 plan + report, INPUT 3 diff instruction (`HEAD` vs
+            `origin/$BASE_BRANCH`), four gates, defect checklist (races, state, DB, perf,
+            edge cases, tests), severity scale, mandatory finding format (file / relevant
+            code / why / reproduction / proposed correction), iteration history on rounds 2+
+          - Run Codex through the full-review.md watchdog runner: prompt written to a file and
+            piped on stdin, `codex exec - -s workspace-write --ephemeral --json` with a writable
+            TMPDIR (workspace-write lets Codex run the suite for the "Missing tests" item; the
+            runner reverts any worktree edit Codex leaves). **Never `codex exec review`** —
+            it discards findings, not just the VERDICT line (Rule 8); a clean review from it is
+            not evidence of a clean branch. No `--full-auto` and no `-a`/`--ask-for-approval`:
+            both are rejected after `exec`.
           - Use Codex's default model only; do not pass `--model` or `-c model=...`
-          - REVIEWER agent (model: "fable", fallback "opus"): parse the review, triage each [P1]/[P2]
-            into ACCEPT (real, must fix) or DISMISS (with reason), and emit a precise fix list
-            (<file>:<line> — what to change — why). It does not edit files.
+          - Capture stderr — empty stdout ≠ approval; retry once. Parse ALL agent_message
+            events; PARTIAL_REVIEW / NO_REVIEW_OUTPUT follow full-review.md Phase 2 (never approve
+            on them; inconclusive → hold the PR)
+          - REVIEWER agent (model: "fable", fallback "opus"): parse the review, triage each
+            BLOCKER/HIGH into ACCEPT (real, must fix), DISMISS (with reason — same-axis
+            escalation or out-of-scope smell; NEVER for [AC]/[ARCH]/[SECURITY]), or RECORDED
+            (an [ARCH] deviation that breaks no invariant — document it, update .pair/PLAN.md).
+            Verify the reproduction scenario is real before accepting. Emit a precise fix list
+            (<file>:<line> — current code — what to change — why), starting from Codex's
+            proposed correction but correcting it when it is wrong. It does not edit files.
+            MEDIUM/LOW → NOTED, batched into one follow-up issue per PR at the end.
             The fix list must be SELF-CONTAINED: exact file, exact line/region, and the current
             code being changed — so the coder can act without re-reading to locate the site.
-          - CODER agent (model: "opus"): apply exactly the ACCEPTed fixes, run tests, commit, push.
+          - CODER agent (model: "opus"): apply exactly the ACCEPTed fixes, add a test for every
+            [CORRECTNESS] fix that had a reproduction scenario, run tests, commit, push.
             Works from the fix list plus `.pair/CONTEXT.md`; does not re-explore the codebase.
             If a fix cannot be applied as specified, it returns the reason instead of improvising.
-          - Update iteration history with outcomes (FIXED/DISMISSED) plus the dismissal reasons
-          - Repeat until Codex approves or 15 iterations
+          - Update iteration history with outcomes (FIXED/DISMISSED/RECORDED/NOTED/BLOCKED) plus
+            the dismissal reasons
+          - Repeat until Codex returns LGTM with no BLOCKER/HIGH, or 15 iterations
+          - CI gate (full-review.md Phase 3.5): wait for the checks on the final SHA.
+            CI_GREEN → APPROVED. CI_FAILED → [BLOCKER][CI] finding from the failing job log,
+            coder fixes, Codex re-reviews, gate again. CI_MISSING → HELD (Rule 10).
 
-       c. Record the final result (approved / max iterations reached)
+       c. Record the final result (APPROVED / MAX_ITERATIONS / BLOCKED / INCONCLUSIVE /
+          CI_FAILED / CI_MISSING)
 
        NOTE: the loop's fix-commit-push cycle is done by the opus coder; the
        accept/dismiss judgement is always fable's. After the loop completes, the PR is
-       either clean (Codex approved) or has been iterated to convergence.
+       either clean (Codex approved AND CI green) or has been iterated to convergence.
 
      If --basic-review mode:
-       Launch a reviewer agent (model: "fable", fallback "opus") running /review-changes
-       This checks: changelog, debug code, secrets, breaking changes, regressions
+       Launch a reviewer agent (model: "fable", fallback "opus") running /review-changes,
+       with `<worktree>/.pair/PLAN.md` and `<worktree>/.pair/REPORT.md` as extra inputs
+       This checks: changelog, debug code, secrets, breaking changes, regressions, and
+       whether every 🔀/➕ item in the report is justified against the plan
        Any required fix is applied by a coder agent (model: "opus")
+       Then run the CI gate (full-review.md Phase 3.5) exactly as in full review
 
   2. IMMEDIATELY after review:
 
@@ -574,15 +613,28 @@ for each PR in [#45, #46, #47]:
        ```
        → Log: "PR #XX held: plan not met" and move to next PR
 
-     If APPROVED (Codex approved in full review, or basic review passed) AND PLAN_MET:
+     If CI_MISSING (a required check never reported on the final SHA):
+       Do NOT merge. Do NOT use --admin. Do NOT touch branch protection.
+       ```bash
+       gh pr comment <PR> --body "Review passed but required CI check(s) never ran on <sha>: <contexts>. Holding until CI is restored and rerun on the same SHA — a check that did not run is not a pass."
+       ```
+       → Log: "PR #XX held: CI missing (<contexts>)" and move to next PR
+
+     If CI_FAILED after the fix loop exhausted its iterations:
+       ```bash
+       gh pr comment <PR> --body "CI failing on <sha>: <checks>. Review loop could not converge — needs manual fix."
+       ```
+       → Log: "PR #XX needs attention: CI failing" and move to next PR
+
+     If APPROVED (Codex LGTM in full review, or basic review passed) AND CI_GREEN AND PLAN_MET:
        ```bash
        # Leave a COMMENT review (can't self-approve on GitHub)
-       gh pr review <PR> --comment --body "Review passed: no breaking changes, no debug code, tests pass, root cause addressed"
+       gh pr review <PR> --comment --body "Review passed: requirements covered, plan followed, no blocking findings, CI green on <sha>"
        gh pr merge <PR> --rebase --delete-branch
        ```
        → Log: "PR #XX merged successfully"
 
-     If REJECTED (basic review found issues, or Codex hit max iterations with unresolved [P1]s):
+     If REJECTED (basic review found issues, or Codex hit max iterations with unresolved BLOCKER/HIGH, or BLOCKED, or INCONCLUSIVE):
        ```bash
        gh pr review <PR> --comment --body "<issue found - needs fix before merge>"
        ```
@@ -598,34 +650,47 @@ for each PR in [#45, #46, #47]:
 PRs to review: [#45, #46, #47]
 
 ─── PR #45 ───
-Run: review changes via git diff
-Result: ✅ SAFE TO MERGE - no breaking changes, changelog present
-Action: gh pr merge 45 --squash --delete-branch
+Run: /full-review 45 --plan=.pair/PLAN.md --report=.pair/REPORT.md
+Result: ✅ VERDICT: LGTM after 2 iterations (1 HIGH[CORRECTNESS] fixed, 1 MEDIUM noted → #61)
+CI:     ✅ CI_GREEN (test, lint)
+Action: gh pr merge 45 --rebase --delete-branch
 Result: ✅ PR #45 merged
 
 ─── PR #46 ───
-Run: review changes via git diff
-Result: ❌ NEEDS CHANGES - Missing changelog entry
-Action: gh pr comment 46 --body "Needs CHANGELOG entry before merge"
-Result: ⚠️ PR #46 queued for manual fix
+Run: /full-review 46 --plan=.pair/PLAN.md --report=.pair/REPORT.md
+Result: ✅ VERDICT: LGTM after 1 iteration
+CI:     ⛔ CI_MISSING (test) — run never started: "billing limit reached"
+Action: gh pr comment 46 --body "Review passed but required CI check(s) never ran ..."
+Result: ⚠️ PR #46 held: CI missing
 
 ─── PR #47 ───
-Run: review changes via git diff
-Result: ✅ SAFE TO MERGE - no issues found
-Action: gh pr merge 47 --squash --delete-branch
-Result: ✅ PR #47 merged
+Run: /full-review 47 --plan=.pair/PLAN.md --report=.pair/REPORT.md
+Result: ⛔ VERDICT: BLOCKED — BLOCKER[AC] "export must include archived rows" needs a schema change
+Action: gh issue create --title "[Follow-up] archived rows in export (from PR #47)" ; gh pr comment 47 ...
+Result: ⚠️ PR #47 needs attention: blocked (follow-up #62)
 ```
 
 ### Merge Command (Copy-Paste Ready)
 
 ```bash
+# 1. CI gate first — never merge on Codex LGTM alone (Rule 10). Poll until no
+#    check is pending, then require every required context green on HEAD.
+gh pr checks <NUMBER> --json name,bucket,state,link
+# bucket: pass | fail | pending | skipping | cancel. Any fail/cancel on a required
+# context → CI_FAILED. A required context absent from the list → CI_MISSING.
+# Required contexts: gh api repos/{owner}/{repo}/branches/<base>/protection/required_status_checks --jq '.contexts[]'
+# (404 = no protection → treat every reported check as required; zero checks reported = CI_MISSING).
+
+# 2. Only on CI_GREEN:
 # NOTE: Cannot self-approve PRs on GitHub, so skip approval and merge directly
 # If admin/merge without approval is enabled:
 gh pr merge <NUMBER> --rebase --delete-branch
 
 # If repo requires approval, add a comment instead:
-gh pr comment <NUMBER> --body "Self-review passed: changelog present, no debug code, no secrets"
+gh pr comment <NUMBER> --body "Self-review passed: requirements covered, plan followed, CI green"
 gh pr merge <NUMBER> --rebase --delete-branch --admin
+# --admin bypasses the APPROVAL requirement only. It is never used to bypass a
+# failing or missing status check — that is CI_FAILED / CI_MISSING, hold the PR.
 ```
 
 ### Handling Self-Authored PRs
@@ -658,11 +723,12 @@ Track results as you go:
 Wave 1 Review Summary:
 ━━━━━━━━━━━━━━━━━━━━━━
 
-✅ PR #45 (Issue #12) - merged
-✅ PR #47 (Issue #22) - merged
-⚠️ PR #46 (Issue #15) - needs changelog
+✅ PR #45 (Issue #12) - merged (2 review iterations, CI green)
+⚠️ PR #46 (Issue #15) - held: CI missing (test never ran)
+⚠️ PR #47 (Issue #22) - blocked: BLOCKER[AC] → follow-up #62
 
-Merged: 2
+Merged: 1
+Held (CI missing): 1
 Needs attention: 1
 ```
 
@@ -688,7 +754,8 @@ Wave 1 Complete
 Issues processed:  4
 PRs created:       3
 PRs reviewed:      3
-Auto-merged:       2
+Auto-merged:       1
+Held (CI missing): 1
 Needs attention:   1
 
 Issues closed:     2 (#12, #15)
@@ -701,6 +768,7 @@ Issues closed:     2 (#12, #15)
 - **Some need attention:**
   - Log them for manual review later
   - Continue with next wave (don't block independent work)
+- **CI missing on every PR in the wave:** CI is down (billing/quota/runner). Stop draining — every further PR would be held anyway. Report the cause and wait for guidance
 - **Critical failure (>50% failed review):** Pause and ask for guidance
 
 ---

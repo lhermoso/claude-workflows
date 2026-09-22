@@ -1,7 +1,7 @@
 ---
 allowed-tools: Bash(git:*), Bash(gh:*), Bash(grep:*), Bash(find:*), Bash(cat:*), Bash(npm:*), Bash(cargo:*), Bash(pnpm:*), Task
 argument-hint: <issue-description OR issue-number> [--no-plan-review] [--basic-review] [--no-verify] [--plan-model=M] [--code-model=M] [--review-model=M]
-description: Full pipeline: create issue (if needed), plan-review it (one Codex pass), fix it, verify implementation against plan (drift report), create PR, full Claude↔Codex review. Plans and reviews run on claude-fable-5 (fallback opus), code is written by claude-opus-5. ALL quality gates ON by default — use --no-plan-review / --basic-review / --no-verify to opt out.
+description: Full pipeline: create issue (if needed), plan-review it (one Codex pass), fix it, verify implementation against plan (Implementation Report), create PR, full Claude↔Codex review (Codex gets requirements + plan + report + diff, four gates, BLOCKER/HIGH/MEDIUM/LOW), then CI must be green. Plans and reviews run on claude-fable-5 (fallback opus), code is written by claude-opus-5. ALL quality gates ON by default — use --no-plan-review / --basic-review / --no-verify to opt out.
 ---
 
 # Issue Pipeline - Automated Flow
@@ -34,6 +34,7 @@ Determine the mode:
 | Plan Review (one Codex pass, before coding) | ON | `--no-plan-review` |
 | Verification Phase (inline plan-adherence + Implementation Report) | ON | `--no-verify` |
 | Full Claude↔Codex review loop on the PR | ON | `--basic-review` (falls back to fast diff review) |
+| CI gate (required checks green on the final SHA before the PR counts as approved) | ON | none — CI is never waived by this pipeline |
 
 The legacy `--plan-review` / `--full-review` flags are accepted but redundant — they are now the default behavior.
 
@@ -44,7 +45,7 @@ The legacy `--plan-review` / `--full-review` flags are accepted but redundant �
 | Role | Covers | Model | Fallback |
 |------|--------|-------|----------|
 | **Planner** | root-cause investigation, writing and revising `.pair/PLAN.md`, running the single Codex plan review and absorbing its findings | `fable` (claude-fable-5) | `opus` |
-| **Reviewer** | Verification Phase + Implementation Report, basic diff review, triaging Codex `[P1]`/`[P2]` findings, improvement-pass triage, merge decision | `fable` (claude-fable-5) | `opus` |
+| **Reviewer** | Verification Phase + Implementation Report, basic diff review, triaging Codex `BLOCKER`/`HIGH` findings, improvement-pass triage, merge decision | `fable` (claude-fable-5) | `opus` |
 | **Coder** | failing test, implementation, lint/test runs, CHANGELOG, commits, PR creation, applying accepted review fixes and improvement passes | `opus` (claude-opus-5) | — |
 
 Overrides: `--plan-model=M`, `--code-model=M`, `--review-model=M` (`fable\|opus\|sonnet\|haiku`).
@@ -57,6 +58,9 @@ Rules:
 4. **Reviewers never write code.** A reviewer emits verdicts and a precise fix list; a coder applies it.
 5. **Codex is unchanged** — external adversarial reviewer on its own default model. Never pass `--model` / `-c model=...` to Codex.
 6. **Subagents run Codex in the FOREGROUND.** Any agent launched via `Task` (planner, reviewer, coder) must invoke `codex exec` as a **blocking** call and stay in the same turn until it returns. Never start Codex with `run_in_background` and then end the turn waiting for a task notification — **a subagent is not woken by its own background task**, so the turn simply ends and the agent sits idle until the orchestrator notices (observed: ~20 min lost per planner). If something is backgrounded anyway, poll it with `BashOutput` in a loop **within the same turn** until it exits. Only the main pipeline loop may background work and rely on being re-invoked.
+7. **Never invoke `codex exec review` — it DISCARDS findings.** Every Codex call in this pipeline, plan review and code review alike, uses plain `codex exec - -s <mode> --ephemeral --json` with the prompt on stdin — `read-only` for the plan review and the improvement passes, `workspace-write` (with a writable `TMPDIR`, per `full-review.md`) for the code review so Codex can run the test suite. Measured on a real drain (COTIntelligence, 8 branches): on one branch the `review` subcommand returned a clean 249-character review *after 7 genuine file reads*, while the **same prompt** through `codex exec -` found two real defects and returned `VERDICT: CHANGES_REQUESTED`; across all eight branches the subcommand never once emitted the VERDICT line. So it is not only the verdict line that is lost — the findings are. **A zero-finding review from `codex exec review` is not evidence that a branch is clean; it is no evidence at all.** If one is ever produced, discard it and re-run through plain `codex exec`.
+8. **The code reviewer receives THREE inputs, every iteration:** (1) original requirements — issue body + comments + PR description; (2) the implementation plan — `<worktree>/.pair/PLAN.md` plus the Implementation Report the Verification Phase wrote to `<worktree>/.pair/REPORT.md`; (3) the diff (`HEAD` vs `origin/<base>`). `$REVIEW_PROMPT` is **always** the Phase 1 template from `~/.claude/commands/full-review.md`, assembled with those inputs. Never send a bare word (`review`) or a diff-only prompt — a reviewer without the plan cannot check architecture deviations, and a reviewer without the issue cannot check requirements. Severity is `BLOCKER` / `HIGH` / `MEDIUM` / `LOW` with axis tags `[CORRECTNESS]` / `[AC]` / `[ARCH]` / `[SECURITY]` / `[CI]`; only BLOCKER and HIGH block. Every finding carries file, relevant code, why, reproduction scenario, proposed correction; Codex proposes, the reviewer triages, the coder applies. Codex never edits.
+9. **CI is a gate, not a report.** Codex LGTM alone is not approval. After the last review iteration, `/full-review` Phase 3.5 waits for the PR's checks and requires every required status context green on the final SHA. `CI_FAILED` goes back to the coder as a `[BLOCKER][CI]` finding and re-enters the review loop; `CI_MISSING` (a check that never ran — billing, quota, runner, provider) is missing evidence, never a pass: the pipeline reports it and stops. Local test runs, the coder's or Codex's, never substitute. Branch protection is never changed by this pipeline.
 
 ---
 
@@ -424,13 +428,13 @@ From the reviewer's verdicts, build:
 
 Status mapping: `MATCHED` → ✅ · `DIVERGED` → 🔀 · `MISSING` → ❌ · `UNVERIFIABLE` → ⚠️.
 
-Post it on the PR: `gh pr comment <pr> --body "<report>"` — this is the durable record of plan-vs-reality.
+Post it on the PR: `gh pr comment <pr> --body "<report>"` — this is the durable record of plan-vs-reality. **Also write the same markdown to `<worktree>/.pair/REPORT.md`** (gitignored, never committed) — the Review Phase passes that file to Codex as part of INPUT 2, so the reviewer starts from the diverged/unplanned items instead of rediscovering them.
 
 ### Step 5 — Decision
 
 - **Any ❌ on an `ac` or `test` claim** → the implementation does not meet its own contract. Relaunch a **coder agent (`opus`)** in the worktree with the failed claims only — apply the missing piece, commit, push — then relaunch the **reviewer agent (`fable`)** to re-verify **only the failed claims** (not the whole list). Max 2 verify-fix cycles; after that, proceed but mark the final pipeline status **NEEDS ATTENTION** and leave the report as the record.
 - **🔀** → non-blocking. The divergence is documented; if the implementation took a *better* path than the plan, fine — the point is it's no longer silent.
-- **➕ unplanned changes** → non-blocking, but they are exactly what the Review Phase should scrutinize first — carry them into the review prompt.
+- **➕ unplanned changes** → non-blocking, but they are exactly what the Review Phase should scrutinize first — they reach Codex through `.pair/REPORT.md` (INPUT 2 of the review prompt).
 
 ---
 
@@ -440,18 +444,19 @@ Post it on the PR: `gh pr comment <pr> --body "<report>"` — this is the durabl
 
 There are two review modes. **Full review is the DEFAULT.** Use basic only if `--basic-review` is in `$ARGUMENTS`:
 
-- **Default (full review):** Uses the Claude↔Codex review loop — Codex reviews the PR, a **reviewer agent (`fable`)** triages the [P1]/[P2] findings, a **coder agent (`opus`)** applies the accepted fixes and pushes, repeat until Codex approves (max 15 iterations). Codex receives iteration history so it won't re-raise dismissed issues. Thorough (~5-15 min).
-- **`--basic-review` mode:** A **reviewer agent (`fable`)** reviews the PR diff for breaking changes, regressions, debug code, secrets, etc. Fast (~1-2 min). Fixes it requires are applied by a coder agent (`opus`).
+- **Default (full review):** Uses the Claude↔Codex review loop — Codex reviews the diff against the requirements AND the plan (four gates + defect checklist), a **reviewer agent (`fable`)** triages the BLOCKER/HIGH findings, a **coder agent (`opus`)** applies the accepted corrections and pushes, repeat until Codex approves (max 15 iterations), then the CI gate. Codex receives iteration history so it won't re-raise dismissed issues. Thorough (~5-15 min).
+- **`--basic-review` mode:** A **reviewer agent (`fable`)** reviews the PR diff for breaking changes, regressions, debug code, secrets, etc. Fast (~1-2 min). Fixes it requires are applied by a coder agent (`opus`). The CI gate still applies.
 
-If the Verification Phase produced an Implementation Report, include its 🔀 diverged and ➕ unplanned items in the review prompt — they are the highest-priority things for the reviewer to scrutinize.
+**Review inputs (both modes):** requirements = `$ISSUE_CONTEXT` + PR body; plan = `<worktree>/.pair/PLAN.md`; report = `<worktree>/.pair/REPORT.md` (or the `## Implementation Report` PR comment if the file is missing); diff = `HEAD` vs `origin/<base>`. The 🔀 diverged and ➕ unplanned items in the report are the first things the reviewer scrutinizes.
 
 ### If `--basic-review` mode:
 
 Run in a reviewer agent (`model: "fable"`, fallback `"opus"`):
 
-1. Get the full PR diff: `gh pr diff <pr-number>`
+1. Get the full PR diff: `gh pr diff <pr-number>`; read `<worktree>/.pair/PLAN.md` and `<worktree>/.pair/REPORT.md` if they exist
 2. Check for:
    - Code changes match the issue requirements
+   - Code changes follow the plan's Proposed Fix / Side-Effects Trace; every 🔀/➕ item in the report is justified
    - No breaking changes (function signatures, API contracts, exports)
    - No debug code (console.log, print statements)
    - No hardcoded secrets or credentials
@@ -460,33 +465,33 @@ Run in a reviewer agent (`model: "fable"`, fallback `"opus"`):
    - No regressions in related functionality
 
 Based on the reviewer's verdict:
-- If **SAFE TO MERGE** → Proceed to merge
+- If **SAFE TO MERGE** → run the **CI gate** (`/full-review` Phase 3.5: wait for checks on the final SHA, required contexts must be `CI_GREEN`). `CI_GREEN` → proceed to merge. `CI_FAILED` → coder agent (`opus`) fixes from the failing job log, reviewer re-checks, gate again. `CI_MISSING` → stop, report which contexts never ran; do not merge.
 - If **NEEDS CHANGES** → hand the fix list to a coder agent (`opus`) to apply, or stop and report if the changes are out of scope
 
 ### If full review (default):
 
 Run the full Claude↔Codex review loop for this PR, with roles split across separate agents:
 
-1. Get PR info: `gh pr view <pr-number> --json title,body,headRefName,baseRefName,files`
-2. Checkout the PR branch: `gh pr checkout <pr-number>`
-3. Determine base branch: `gh pr view <pr-number> --json baseRefName -q '.baseRefName'`
-4. Initialize `ITERATION_HISTORY = ""`
-5. **Loop (max 15 iterations):**
-   a. Build Codex prompt:
-      - Iteration 1: `review`
-      - Iteration N>1: Include `ITERATION_HISTORY` with instructions to skip dismissed/fixed issues
-   b. Run Codex review with the default model only — pipe the prompt via stdin: `printf '%s' "$REVIEW_PROMPT" | codex exec review - --ephemeral --json --title "..." 2> "$CODEX_ERR"`
-      Omit `--base` (it is mutually exclusive with a custom prompt) — instruct Codex in-prompt to diff `HEAD` vs `origin/$BASE_BRANCH`. Do NOT use `--full-auto` (errors on the `review` subcommand). Do not pass `--model` or `-c model=...`. Capture stderr; empty stdout ≠ approval.
-   c. Parse JSONL output for the last `agent_message` text
-   d. If no [P1]/[P2] issues → **APPROVED**, break
-   e. **Reviewer agent (`model: "fable"`, fallback `"opus"`):** triage each [P1]/[P2] into ACCEPT (real, must fix) or DISMISS (with reason) and emit a precise fix list (`<file>:<line>` — what to change — why). It does not edit files. The fix list must be **self-contained**: exact file, exact line/region, and the current code being changed, so the coder can act without re-reading to locate the site.
-   f. **Coder agent (`model: "opus"`):** apply exactly the ACCEPTed fixes, run tests, commit, push. Works from the fix list plus `.pair/CONTEXT.md`; does not re-explore the codebase. If a fix can't be applied as specified, return the reason instead of improvising.
-   g. Update `ITERATION_HISTORY` with outcomes (FIXED/DISMISSED/NOTED) plus dismissal reasons
+Run `/full-review <pr-number> --plan=<worktree>/.pair/PLAN.md --report=<worktree>/.pair/REPORT.md` inline, from the worktree, with roles split across agents as below. The steps mirror `full-review.md` Phases 0–3.5; that file is the source of truth for the prompt template, the runner, and the parser.
+
+1. **Phase 0 — inputs.** Get PR info, checkout the branch, fetch `origin/<base>`, build `PR_CONTEXT_FILE` + `ISSUE_CONTEXT_FILE` (issue body AND comments), build `PLAN_CONTEXT_FILE` from `.pair/PLAN.md` and `REPORT_CONTEXT_FILE` from `.pair/REPORT.md` (fallback: the `## Implementation Report` PR comment). If the plan file is missing while the planner ran, that is a pipeline bug — stop and report it rather than reviewing without the plan.
+2. Initialize `ITERATION_HISTORY = ""`
+3. **Loop (max 15 iterations):**
+   a. Assemble `$REVIEW_PROMPT` from the `full-review.md` Phase 1 template — INPUT 1 (requirements), INPUT 2 (plan + report), INPUT 3 (diff instruction), four gates, defect checklist, severity scale, mandatory finding format, and `ITERATION_HISTORY` (iteration N>1 carries the FIXED/DISMISSED/RECORDED outcomes so Codex skips them).
+   b. Run Codex with the default model only — write the prompt to a file and pipe it on stdin through the `full-review.md` watchdog runner: `codex exec - -s workspace-write --ephemeral --json` with a writable `TMPDIR` (workspace-write lets Codex run the test suite for the "Missing tests" checklist item; the runner reverts any worktree edit Codex leaves). **Never `codex exec review`** — it discards findings, not just the VERDICT line (Rule 7), so a clean review from it is not evidence of a clean branch. Do NOT pass `--full-auto` or `-a`/`--ask-for-approval` (both are rejected after `exec`; plain `exec` is non-interactive and auto-approves within its sandbox). Do not pass `--model` or `-c model=...`. Capture stderr; empty stdout ≠ approval; retry once.
+   c. Parse **all** `agent_message` events (`parse_review`), not just the last — prefer the message carrying `VERDICT:`/the AC matrix; `PARTIAL_REVIEW` / `NO_REVIEW_OUTPUT` follow `full-review.md` Phase 2 (never approve on them).
+   d. If `VERDICT: LGTM` and no BLOCKER/HIGH remain → Codex gate passed, go to step 4
+   e. **Reviewer agent (`model: "fable"`, fallback `"opus"`):** triage each BLOCKER/HIGH into ACCEPT (real, must fix) or DISMISS (with reason — same-axis escalation, out-of-scope smell; **never** for `[AC]`/`[ARCH]`/`[SECURITY]`) or, for `[ARCH]` deviations that break no invariant, RECORDED (document the better path, update `.pair/PLAN.md`). Verify each finding's reproduction scenario is real before accepting. Emit a precise fix list (`<file>:<line>` — current code — what to change — why), starting from Codex's proposed correction but correcting it when it is wrong. It does not edit files. MEDIUM/LOW → NOTED, batched into one follow-up issue at the end.
+   f. **Coder agent (`model: "opus"`):** apply exactly the ACCEPTed fixes, add a test for every `[CORRECTNESS]` fix that had a reproduction scenario, run tests, commit, push. Works from the fix list plus `.pair/CONTEXT.md`; does not re-explore the codebase. If a fix can't be applied as specified, return the reason instead of improvising.
+   g. Update `ITERATION_HISTORY` with outcomes (FIXED/DISMISSED/RECORDED/NOTED/BLOCKED) plus dismissal reasons
    h. Repeat
+4. **CI gate (`full-review.md` Phase 3.5).** Wait for the checks on the final SHA. `CI_GREEN` → **APPROVED**. `CI_FAILED` → pull the failing job log, record a `[BLOCKER][CI]` finding in `ITERATION_HISTORY`, coder fixes, back to step 3 (Codex re-reviews the CI fix), then this gate again. `CI_MISSING` → **not approved**: report the contexts that never ran and stop; do not merge, do not touch branch protection, do not substitute local runs.
 
 Based on the result:
-- If **Codex approved** → Proceed to improvement passes
-- If **Max iterations with unresolved [P1]s** → List remaining issues and stop
+- If **APPROVED** (Codex LGTM + CI green) → Proceed to improvement passes
+- If **Max iterations with unresolved BLOCKER/HIGH** → List remaining issues and stop
+- If **BLOCKED** → follow-up issue with remediation plan; report the PR as incomplete and stop
+- If **CI_FAILED / CI_MISSING** → report with the failing/missing contexts and stop
 
 ---
 
@@ -540,7 +545,7 @@ print(result or '')
 
 If `$IMPROVEMENT_PROMPT` is empty or says "no improvements" → **stop early, don't run pass 2.**
 
-Otherwise: a **reviewer agent (`fable`)** decides which of Codex's suggestions to accept (reject anything that is a rewrite, scope creep, or contradicts the plan), then a **coder agent (`opus`)** applies the accepted ones — checkout the PR branch, edit the named files, run tests, commit (`improve: quality pass N`), push.
+Otherwise: a **reviewer agent (`fable`)** decides which of Codex's suggestions to accept (reject anything that is a rewrite, scope creep, or contradicts the plan), then a **coder agent (`opus`)** applies the accepted ones — checkout the PR branch, edit the named files, run tests, commit (`improve: quality pass N`), push. An improvement pass moves the SHA, so **re-run the CI gate after the last pass**; the pipeline's final status is the CI result on the final SHA.
 
 ---
 
@@ -555,7 +560,9 @@ Issue:  #<number> - <title>
 PR:     #<pr-number>
 Plan:   <plan-review result: reviewed | skipped | unavailable>
 Report: <N as planned · N diverged · N missing · N unplanned | skipped>
-Status: <review result>
+Review: <APPROVED | MAX_ITERATIONS | BLOCKED | INCONCLUSIVE> · N iterations · inputs: requirements + plan + report + diff
+CI:     <GREEN (<checks>) | FAILED (<checks>) | MISSING (<contexts>)>
+Status: <APPROVED only when Review=APPROVED and CI=GREEN; otherwise NEEDS ATTENTION with the reason>
 Models: plan=<fable|opus|…> · code=<opus|…> · review=<fable|opus|…>
 URL:    <pr-url>
 
@@ -580,6 +587,8 @@ If any phase fails:
 - **Subagent fails to create worktree:** Check if directory already exists, or if branch name conflicts
 - **Tests fail:** Report which tests failed and the error output, suggest manual investigation
 - **PR creation fails:** Check if branch was pushed, if remote is accessible
+- **`.pair/PLAN.md` or `.pair/REPORT.md` missing at review time:** the worktree was removed early or the Verification Phase did not write the report. Do not review without them when the planner ran — report the pipeline bug
+- **CI_MISSING:** a required check never reported (billing, quota, runner, provider). Never a pass. Report the contexts and stop; the user restores CI and reruns the same SHA
 
 ---
 
@@ -590,4 +599,5 @@ If any phase fails:
 - Each phase runs with fresh context (no /clear needed)
 - Worktrees ensure parallel work doesn't conflict — and must NOT be removed until the Verification Phase has read `.pair/PLAN.md` from them
 - Review happens automatically but human can override
-- All quality gates are ON by default. Fastest escape hatch: `--no-plan-review --no-verify --basic-review` (roughly the old default behavior)
+- All quality gates are ON by default. Fastest escape hatch: `--no-plan-review --no-verify --basic-review` (roughly the old default behavior). The CI gate has no escape hatch in this pipeline
+- The Verification Phase (fable, plan-adherence) and Codex's architecture gate overlap on purpose: the verifier produces the Implementation Report that Codex then starts from, and it is the one adherence check that still runs when Codex is unavailable
