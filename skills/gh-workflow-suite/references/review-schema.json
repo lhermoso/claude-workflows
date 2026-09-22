@@ -10,24 +10,35 @@
     "reviewed_base_sha",
     "reviewed_merge_base_sha",
     "summary",
+    "plan_provided",
     "findings",
     "acceptance_criteria",
     "acceptance_criteria_sources",
     "no_explicit_criteria_reason",
+    "architecture_summary",
     "security_categories_checked",
-    "security_summary"
+    "security_summary",
+    "defect_checklist"
   ],
   "properties": {
     "schema_version": {
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "verdict": {
       "type": "string",
-      "enum": ["APPROVED", "CHANGES_REQUESTED", "BLOCKED", "INCONCLUSIVE"]
+      "enum": [
+        "APPROVED",
+        "CHANGES_REQUESTED",
+        "BLOCKED",
+        "INCONCLUSIVE"
+      ]
     },
     "inconclusive_reason": {
-      "type": ["string", "null"]
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "reviewed_head_sha": {
       "type": "string",
@@ -54,6 +65,10 @@
       "type": "string",
       "minLength": 1
     },
+    "plan_provided": {
+      "type": "boolean",
+      "description": "True when an implementation plan (plan.md) was part of the evidence. ARCH findings are only valid when true."
+    },
     "findings": {
       "type": "array",
       "items": {
@@ -64,9 +79,11 @@
           "category",
           "severity",
           "title",
-          "failure_mode",
           "file",
           "line",
+          "relevant_code",
+          "failure_mode",
+          "reproduction",
           "evidence",
           "minimal_fix",
           "scope",
@@ -82,27 +99,56 @@
           },
           "category": {
             "type": "string",
-            "enum": ["CORRECTNESS", "AC", "SECURITY", "TEST"],
-            "description": "Use AC for any finding referenced by an explicit acceptance criterion marked PARTIAL or MISSING. Put security, correctness, or test details in that AC finding's evidence, or add separate category-specific findings."
+            "enum": [
+              "CORRECTNESS",
+              "AC",
+              "ARCH",
+              "SECURITY",
+              "TEST"
+            ],
+            "description": "Use AC for any finding referenced by an explicit acceptance criterion marked PARTIAL or MISSING. Use ARCH for a deviation from the implementation plan that breaks a recorded contract or invariant (requires plan_provided). Use TEST for a missing or wrong test. Put security, correctness, or test details in that AC finding's evidence, or add separate category-specific findings."
           },
           "severity": {
             "type": "string",
-            "enum": ["P1", "P2", "P3"]
+            "enum": [
+              "BLOCKER",
+              "HIGH",
+              "MEDIUM",
+              "LOW"
+            ],
+            "description": "BLOCKER: production breakage or data loss on a realistic path, major exploit, or explicit requirement MISSING. HIGH: concrete bug on a common path, limited exploit, explicit requirement PARTIAL, plan deviation breaking an invariant, or the plan's primary test absent. MEDIUM: needs uncommon conditions, perf regression without visible impact, missing edge-case test, hardening. LOW: naming, style, cleanup. Only BLOCKER and HIGH block."
           },
           "title": {
             "type": "string",
             "minLength": 1
           },
-          "failure_mode": {
-            "type": "string",
-            "minLength": 1
-          },
           "file": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "line": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 1
+          },
+          "relevant_code": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The exact lines at file:line, quoted verbatim from the reviewed head."
+          },
+          "failure_mode": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Why it is a problem: the mechanism, and which invariant, requirement, or plan item is violated."
+          },
+          "reproduction": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Concrete inputs or state that produce the wrong behavior. For AC/ARCH findings: the criterion or plan item and the evidence it is unmet."
           },
           "evidence": {
             "type": "string",
@@ -110,20 +156,30 @@
           },
           "minimal_fix": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "description": "Proposed correction at that site. The reviewer never applies it."
           },
           "scope": {
             "type": "string",
-            "enum": ["DIFF", "ADJACENT"]
+            "enum": [
+              "DIFF",
+              "ADJACENT"
+            ]
           },
           "adjacent_justification": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "broad_or_risky_fix": {
             "type": "boolean"
           },
           "remediation": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       }
@@ -154,14 +210,20 @@
           },
           "source": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "description": "Issue #N, PR body, plan.md, or inferred."
           },
           "explicit": {
             "type": "boolean"
           },
           "status": {
             "type": "string",
-            "enum": ["COVERED", "PARTIAL", "MISSING", "NA"]
+            "enum": [
+              "COVERED",
+              "PARTIAL",
+              "MISSING",
+              "NA"
+            ]
           },
           "evidence": {
             "type": "string",
@@ -169,10 +231,20 @@
           },
           "severity": {
             "type": "string",
-            "enum": ["NONE", "P1", "P2", "P3"]
+            "enum": [
+              "NONE",
+              "BLOCKER",
+              "HIGH",
+              "MEDIUM",
+              "LOW"
+            ],
+            "description": "Explicit MISSING must be BLOCKER; explicit PARTIAL must be HIGH or BLOCKER; COVERED and NA must be NONE."
           },
           "finding_id": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "For an explicit criterion with PARTIAL or MISSING status, this must reference a finding whose category is AC. Otherwise use null."
           }
         }
@@ -186,7 +258,15 @@
       }
     },
     "no_explicit_criteria_reason": {
-      "type": ["string", "null"]
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "architecture_summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "How the diff compares with the implementation plan's Proposed Fix, Files, and Side-Effects Trace, starting from the Implementation Report's diverged/unplanned items, and whether the plan's weakest assumption was confirmed or refuted. When plan_provided is false, state that the gate is not applicable."
     },
     "security_categories_checked": {
       "type": "array",
@@ -211,6 +291,165 @@
     "security_summary": {
       "type": "string",
       "minLength": 1
+    },
+    "defect_checklist": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Every item must be checked with evidence for a conclusive verdict. A defect found under an item becomes a finding; the item's evidence names that finding id.",
+      "required": [
+        "race_conditions",
+        "state_inconsistencies",
+        "database_issues",
+        "performance_regressions",
+        "missing_edge_cases",
+        "missing_tests"
+      ],
+      "properties": {
+        "race_conditions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "checked",
+            "defect_found",
+            "evidence"
+          ],
+          "properties": {
+            "checked": {
+              "type": "boolean",
+              "description": "True only when the item was actually examined against the diff and affected paths."
+            },
+            "defect_found": {
+              "type": "boolean",
+              "description": "True when the examination produced at least one finding; name its id in evidence."
+            },
+            "evidence": {
+              "type": "string",
+              "minLength": 1,
+              "description": "What was examined and what was found, with file:line or finding ids."
+            }
+          }
+        },
+        "state_inconsistencies": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "checked",
+            "defect_found",
+            "evidence"
+          ],
+          "properties": {
+            "checked": {
+              "type": "boolean",
+              "description": "True only when the item was actually examined against the diff and affected paths."
+            },
+            "defect_found": {
+              "type": "boolean",
+              "description": "True when the examination produced at least one finding; name its id in evidence."
+            },
+            "evidence": {
+              "type": "string",
+              "minLength": 1,
+              "description": "What was examined and what was found, with file:line or finding ids."
+            }
+          }
+        },
+        "database_issues": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "checked",
+            "defect_found",
+            "evidence"
+          ],
+          "properties": {
+            "checked": {
+              "type": "boolean",
+              "description": "True only when the item was actually examined against the diff and affected paths."
+            },
+            "defect_found": {
+              "type": "boolean",
+              "description": "True when the examination produced at least one finding; name its id in evidence."
+            },
+            "evidence": {
+              "type": "string",
+              "minLength": 1,
+              "description": "What was examined and what was found, with file:line or finding ids."
+            }
+          }
+        },
+        "performance_regressions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "checked",
+            "defect_found",
+            "evidence"
+          ],
+          "properties": {
+            "checked": {
+              "type": "boolean",
+              "description": "True only when the item was actually examined against the diff and affected paths."
+            },
+            "defect_found": {
+              "type": "boolean",
+              "description": "True when the examination produced at least one finding; name its id in evidence."
+            },
+            "evidence": {
+              "type": "string",
+              "minLength": 1,
+              "description": "What was examined and what was found, with file:line or finding ids."
+            }
+          }
+        },
+        "missing_edge_cases": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "checked",
+            "defect_found",
+            "evidence"
+          ],
+          "properties": {
+            "checked": {
+              "type": "boolean",
+              "description": "True only when the item was actually examined against the diff and affected paths."
+            },
+            "defect_found": {
+              "type": "boolean",
+              "description": "True when the examination produced at least one finding; name its id in evidence."
+            },
+            "evidence": {
+              "type": "string",
+              "minLength": 1,
+              "description": "What was examined and what was found, with file:line or finding ids."
+            }
+          }
+        },
+        "missing_tests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "checked",
+            "defect_found",
+            "evidence"
+          ],
+          "properties": {
+            "checked": {
+              "type": "boolean",
+              "description": "True only when the item was actually examined against the diff and affected paths."
+            },
+            "defect_found": {
+              "type": "boolean",
+              "description": "True when the examination produced at least one finding; name its id in evidence."
+            },
+            "evidence": {
+              "type": "string",
+              "minLength": 1,
+              "description": "What was examined and what was found, with file:line or finding ids."
+            }
+          }
+        }
+      }
     }
   }
 }

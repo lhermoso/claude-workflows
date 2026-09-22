@@ -14,13 +14,43 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
 - **Codex `gh-workflow-suite`**: added complete `full-review`, `issue-pipeline`,
   and `drain-issues` skill references; a bounded no-shell reviewer gateway;
   strict JSON review schema; and a conservative user-global installer that
-  replaces the flattened `/import` artifact with the full skill package. Claude
-  is preferred, with one fresh read-only Codex fallback whenever Claude cannot
-  produce a valid, conclusive review
+  replaces the flattened `/import` artifact with the full skill package.
+  Reviewer routing is described under Changed (Astra / Fable / Astra): a
+  configurable primary per gate class with the other provider as a sticky,
+  fail-closed fallback
 - **`/issue-pipeline` + `/drain-issues`**: **Plan-Adherence Verification** (Verification Phase / Phase 5.5) — after implementation, a Workflow fans out one verifier agent per plan claim (acceptance criteria, file changes, test plan, side-effect invariants) against the actual worktree code + PR diff; DIVERGED/MISSING findings are adversarially confirmed by two independent refuters; a reverse-trace agent maps diff hunks back to claims to surface **unplanned changes**. Output is an **Implementation Report** posted as a PR comment (✅ as planned · 🔀 diverged · ❌ missing · ➕ unplanned). Confirmed-missing AC/test claims trigger a fix-and-reverify cycle; in `/drain-issues`, PLAN_NOT_MET PRs are blocked from auto-merge. Falls back to issue acceptance criteria when no `.pair/PLAN.md` exists. Opt out with `--no-verify`
 
 ### Changed
 
+- **Code review now receives the plan, not just the diff — the full REQUIREMENTS → PLAN → DIFF → REVIEW → FIXES → CI cycle** (`/full-review`, `/issue-pipeline`, `/drain-issues`):
+  - **Three inputs to Codex, every iteration:** original requirements (linked issues with comments + PR body), the implementation plan (`.pair/PLAN.md` plus the Implementation Report, now also written to `.pair/REPORT.md` by the Verification Phase / Phase 5.5), and the diff. `/full-review` takes `--plan=` / `--report=` and auto-detects `.pair/` or the `## Implementation Report` PR comment; the pipeline and the drainer always pass both. Previously `.pair/PLAN.md` never reached the reviewer (gitignored, worktree-local) and the pipeline's review step said literally `Iteration 1: review`
+  - **Four gates instead of three:** correctness, requirements (AC matrix), **architecture** (diff vs the plan's Proposed Fix / Side-Effects Trace, starting from the report's 🔀/➕ items; N/A without a plan), security — plus an explicit **defect checklist** every gate answers with evidence: race conditions, state inconsistencies, database issues, performance regressions, missing edge cases, missing tests
+  - **Severity is `BLOCKER` / `HIGH` / `MEDIUM` / `LOW`** with axis tags `[CORRECTNESS]` / `[AC]` / `[ARCH]` / `[SECURITY]` / `[CI]`; only BLOCKER and HIGH block. Replaces `[P1]`/`[P2]`/`[P3]` (legacy mapping: P1→BLOCKER, P2→HIGH, P3→MEDIUM)
+  - **Mandatory finding format:** file, relevant code (quoted), why it is a problem, reproduction scenario, proposed correction. Codex proposes and never edits; the fable reviewer triages (ACCEPT / DISMISS / RECORDED for harmless `[ARCH]` deviations), the opus coder applies. A finding without a reproduction is capped at HIGH (not for `[AC]`/`[SECURITY]`); the runner reverts any worktree edit Codex leaves behind
+  - **CI gate (new Phase 3.5):** Codex LGTM alone is no longer approval. `/full-review` polls `gh pr checks` on the final SHA and requires every required status context green (`CI_GREEN`); `CI_FAILED` becomes a `[BLOCKER][CI]` finding and re-enters the fix + review loop; `CI_MISSING` (a check that never ran — billing, quota, runner) is missing evidence, never a pass. `/drain-issues` never merges without `CI_GREEN`, holds `CI_MISSING` PRs with a comment, stops the drain when CI is down for the whole wave, and never uses `--admin` to bypass a check. `/issue-pipeline` re-runs the gate after improvement passes and reports `CI:` in its final output. Local test runs, Codex's or the coder's, never substitute
+  - The Verification Phase (fable, plan-adherence) is kept as an independent gate: it produces the report Codex starts from, and it is the adherence check that still runs when Codex is unavailable
+- **Codex skill `gh-workflow-suite` mirrors the cycle as Astra / Fable / Astra** — Codex plans and orchestrates, a fresh Claude Fable process implements, a fresh read-only Codex process reviews:
+  - **New implementer runner `scripts/run_claude_implement.py`** + `references/implement-schema.json`: runs `claude -p --safe-mode --permission-mode dontAsk` on Fable inside one worktree from `plan.md` + `context.md`, with a fixed contract (no Git mutations, failing test first, no test weakening, `plan_rejected` instead of improvising). After the run it verifies `HEAD` and the index did not move and that the declared `changed_files` equal the worktree's actual changes; structured result carries `tests_written`, `commands_run`, `plan_deviations`, `brief_gaps`. Exit codes `0/10/11` = success / plan_rejected / failed. The active Codex task never writes production code anymore; it plans, triages findings into fix lists, verifies, stages, commits, pushes
+  - **Review gateway `scripts/run_review.py` generalized to `--primary {codex,claude}`** (default `codex`, env `REVIEW_PRIMARY_PROVIDER`) with the other provider as the sticky fallback, tracked per primary in provider state v3 (`routing` / `fallbacks` / `fallback_attempted_gates`). Code review (adherence, basic, full) is Codex-primary because Fable wrote the code; plan gates are Claude-primary because Codex wrote the plan — the reviewer vendor always differs from the writer. `--writer` (default `claude`) feeds the `independent_vendor_review` provenance flag. The one validator-guided repair generation now applies to whichever provider is the fallback
+  - **Review schema v2** (`references/review-schema.json`, validators in `run_claude_review.py`): severity `BLOCKER/HIGH/MEDIUM/LOW` (only the first two block), category adds `ARCH` (valid only when `plan_provided`), findings require `relevant_code`, `failure_mode`, `reproduction`, `minimal_fix`; new top-level `plan_provided`, `architecture_summary`, and a six-item `defect_checklist` (races, state, DB, perf, edge cases, tests) that must be fully checked for any conclusive verdict; explicit MISSING criteria must be BLOCKER, explicit PARTIAL at least HIGH. Legacy `schema_version: 1` reviews are rejected
+  - **Reviewer inputs and gates** (`references/full-review.md`): `CONTEXT_DIR` gains `plan.md`, `implementation-report.md`, and `test-evidence.md`; the prompt runs four gates (correctness, requirements, architecture, security) plus the defect checklist, forbids rewriting code, and asks for the mandatory finding format. New **CI gate** section between `APPROVED` and publication: `CI_FAILED` goes back through the implementer and a new review round, `CI_MISSING` is never a pass; `drain-issues` holds such PRs and stops the drain when a whole wave is held. The reviewer stays read-only on this side (it does not run tests; test evidence reaches it as files)
+  - `SKILL.md`, `agents/openai.yaml`, `porting-notes.md` (role mapping, implementer runner section, env vars), `issue-pipeline.md`, `drain-issues.md`, `workflows.md` rewritten for the new roles; installer manifest includes the new files. Self-tests: gateway 31, review validator 13, implementer 12
+- **`codex exec review` is banned everywhere — it discards findings, not just the VERDICT
+  line**: `/drain-issues` (review loop) and `/issue-pipeline` (full-review loop) still invoked
+  the subcommand; both now run `printf '%s' "$PROMPT" | codex exec - -s read-only --ephemeral
+  --json`, with the `HEAD` vs `origin/$BASE_BRANCH` diff instruction in-prompt. Measured on a
+  real drain (COTIntelligence, 8 branches): on one branch the subcommand returned a clean
+  249-character review *after 7 genuine file reads*, while the same prompt through plain
+  `codex exec` found two real defects and returned `VERDICT: CHANGES_REQUESTED`; across all
+  eight branches it never once emitted the VERDICT line. Each of `/drain-issues`,
+  `/issue-pipeline` and `/full-review` now records the consequence explicitly: **a zero-finding
+  review from `codex exec review` is not evidence that a branch is clean — it is no evidence at
+  all**, and must be discarded and re-run through plain `codex exec`. `/full-review` had already
+  retired the subcommand for hanging silently; that note now carries the dropped-findings
+  evidence too, since a silent hang is at least visible and a false clean review is not.
+  Supersedes the `codex exec review` half of the 0.136.0 flag fix below (#14, #16); the stdin
+  `-` form, the `--model` ban, the foreground-in-subagent rule and the `-a`/`--full-auto`
+  gotchas are unchanged
 - **`/drain-issues` + `/issue-pipeline` planner agents must run Codex in the foreground**: planners were
   launching the plan review with `run_in_background` and ending the turn to wait for a
   task notification that can never arrive — a subagent is not woken by its own background
@@ -104,6 +134,7 @@ Types: `Added`, `Changed`, `Fixed`, `Removed`
 ### Fixed
 
 - **`/full-review` + `/issue-pipeline` + `/drain-issues`**: corrected Codex invocations to flags that actually parse on codex-cli 0.136.0 — prompts piped via stdin (positional args silently hang); plain `codex exec` uses `-s <mode>` only (non-interactive auto-approves — `-a`/`--ask-for-approval` is a global flag and errors after `exec`); `codex exec review` uses only `--ephemeral --json --title` (it rejects `-s`, `-a`, and `--full-auto`, and runs read-only by default); the `/issue-pipeline` full-review loop uses `codex exec review -` without `--base` (mutually exclusive with a custom prompt), diffing in-prompt — Fixes #14, #16
+  <br>**Superseded:** the `codex exec review` guidance in this entry is no longer valid — the subcommand is banned outright (see Changed, above). Its flag notes are kept only as a record of what was true on 0.136.0.
 
 ## [1.2.0] - 2026-03-13
 

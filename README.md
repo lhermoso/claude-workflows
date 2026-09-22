@@ -5,8 +5,12 @@ A collection of slash commands for [Claude Code](https://docs.anthropic.com/en/d
 Drop these into `~/.claude/commands/` and get a complete CI-like pipeline inside your terminal.
 
 This repo also includes a user-global Codex skill source under
-[`skills/gh-workflow-suite`](skills/gh-workflow-suite). Install it with the
-bundled installer to use the workflows from any repository.
+[`skills/gh-workflow-suite`](skills/gh-workflow-suite) — the same cycle run
+from the Codex side, mirrored: **Codex plans, a fresh Claude Fable process
+implements, a fresh Codex process reviews** (Astra / Fable / Astra), with
+Claude as the sticky review fallback and a CI gate before anything is marked
+ready. Install it with the bundled installer to use the workflows from any
+repository.
 
 ## Quick overview
 
@@ -330,29 +334,28 @@ Full pipeline: create an issue (if needed), fix it, create a PR, and self-review
 
 ### `/full-review`
 
-Claude ↔ Codex review loop. Codex reviews the PR, Claude fixes issues, repeat until Codex approves or max iterations.
+Claude ↔ Codex review loop. Codex reviews the diff **against the original requirements and the implementation plan**, Claude fixes, repeat until Codex approves; then CI must be green.
 
 ```bash
-/full-review <pr-number>
+/full-review <pr-number> [--plan=<path/to/PLAN.md>] [--report=<path/to/REPORT.md>] [--no-ci-gate]
 ```
 
 ```bash
 /full-review 123
+/full-review 123 --plan=.pair/PLAN.md --report=.pair/REPORT.md   # what /issue-pipeline and /drain-issues pass
 ```
 
 **Requirements:** [Codex CLI](https://github.com/openai/codex) (`codex`) must be installed.
 
 **How it works:**
-1. Checks out the PR branch
-2. Runs Codex in `--full-auto` mode to review the diff
-3. Parses Codex output for severity tags:
-   - `[P1]` Critical — must fix
-   - `[P2]` Major — must fix
-   - `[P3]` Minor — noted but not blocking
-4. Fixes all `[P1]` and `[P2]` issues, commits, and pushes
+1. Checks out the PR branch and gathers three inputs: requirements (linked issues + PR body), the implementation plan (`.pair/PLAN.md` + Implementation Report, auto-detected or via `--plan`/`--report`), and the diff
+2. Runs `codex exec` (stdin prompt, `workspace-write` sandbox so Codex can run tests; never `codex exec review`) across four gates — correctness, requirements, architecture, security — plus a defect checklist: races, state inconsistencies, DB issues, performance regressions, missing edge cases, missing tests
+3. Every finding is `BLOCKER` / `HIGH` / `MEDIUM` / `LOW`, tagged `[CORRECTNESS]` / `[AC]` / `[ARCH]` / `[SECURITY]`, with file, relevant code, why, reproduction scenario, proposed correction. Codex never edits code
+4. Fixes all `BLOCKER` and `HIGH` findings, commits, and pushes (`MEDIUM`/`LOW` are noted, batched into a follow-up)
 5. Maintains an **iteration history** passed to Codex each round so it won't re-raise fixed/dismissed issues
-6. Repeats until Codex approves or 15 iterations reached
-7. Prints a summary with all iterations and fixes applied
+6. Repeats until Codex returns `VERDICT: LGTM` or max iterations (6)
+7. **CI gate:** waits for the PR's checks; required contexts must be green on the final SHA. A failing check goes back to the fix loop; a check that never ran is `CI_MISSING`, never a pass
+8. Prints a summary with gate status, CI status, AC matrix, and all fixes applied
 
 ---
 

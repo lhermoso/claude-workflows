@@ -1,0 +1,100 @@
+{
+  "title": "Structured implementation result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "summary",
+    "changed_files",
+    "tests_written",
+    "commands_run",
+    "plan_deviations",
+    "brief_gaps",
+    "rejection_reason",
+    "rejection_evidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["success", "plan_rejected", "failed"],
+      "description": "success: the plan (or fix list) was implemented and local checks passed. plan_rejected: implementing revealed the plan is wrong; nothing was left half-done. failed: could not complete; explain in summary."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What was implemented, in a few sentences. For failed, what blocked."
+    },
+    "changed_files": {
+      "type": "array",
+      "description": "Every repository-relative path you created, modified, or deleted. Must match the worktree exactly; the runner cross-checks it.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "tests_written": {
+      "type": "array",
+      "description": "Each new or modified test, with the behavior it asserts.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "name", "asserts", "failed_before_fix"],
+        "properties": {
+          "file": {"type": "string", "minLength": 1},
+          "name": {"type": "string", "minLength": 1},
+          "asserts": {"type": "string", "minLength": 1},
+          "failed_before_fix": {
+            "type": ["boolean", "null"],
+            "description": "True when the test was run before the fix and failed for the planned reason; null when not applicable (regression-only test)."
+          }
+        }
+      }
+    },
+    "commands_run": {
+      "type": "array",
+      "description": "Test, lint, typecheck, and build commands actually executed, with their outcome.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "exit_code", "summary"],
+        "properties": {
+          "command": {"type": "string", "minLength": 1},
+          "exit_code": {"type": "integer"},
+          "summary": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "plan_deviations": {
+      "type": "array",
+      "description": "Anywhere the implementation differs from the plan on purpose, with the reason. Silent deviations are a defect.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plan_item", "what_changed", "why"],
+        "properties": {
+          "plan_item": {"type": "string", "minLength": 1},
+          "what_changed": {"type": "string", "minLength": 1},
+          "why": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "brief_gaps": {
+      "type": "array",
+      "description": "Anything the context brief was missing or wrong about. Non-blocking; tells the planner what to add next time.",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "rejection_reason": {
+      "type": ["string", "null"],
+      "description": "Required for plan_rejected: why the plan cannot be implemented as written (root cause misidentified, impossible change, breaks an unlisted caller)."
+    },
+    "rejection_evidence": {
+      "type": ["string", "null"],
+      "description": "Required for plan_rejected: file:line evidence."
+    }
+  }
+}

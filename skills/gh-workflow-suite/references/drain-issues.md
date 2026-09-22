@@ -15,16 +15,21 @@ auto-merge after gates pass. Cap normal writer concurrency at three. Honor label
 `--max-parallel=N`, `--dry-run`, `--no-merge`, `--skip-review`, `--basic-review`,
 `--no-plan-review`, `--no-verify`, and `--get-all`.
 
-Create one run-shared reviewer-provider state before spawning workers. Claude is
-preferred until it fails to produce a valid, conclusive review; then every
-remaining gate in every worker uses the sticky fresh read-only Codex fallback.
-Pass the same absolute provider-state path to every worker; workers must not
-create their own. A new `drain-issues` run tries Claude again.
+Roles per issue (Astra / Fable / Astra): a Codex worker plans and
+orchestrates, a fresh Claude Fable process implements through
+`run_claude_implement.py`, and fresh gateway processes review — Claude-primary
+for plan gates, Codex-primary for adherence and final review.
+
+Create one run-shared reviewer-provider state before spawning workers. Each
+primary is used until it fails to produce a valid, conclusive review; then every
+remaining gate of that class in every worker uses the sticky fallback. Pass the
+same absolute provider-state path to every worker; workers must not create
+their own. A new `drain-issues` run tries the configured primaries again.
 
 Make every logical gate ID unique across the whole drain run. Prefix it with its
 issue or PR number plus stage, round, and a short SHA when applicable (for
 example, `issue-42-full-review-r1-a1b2c3d4e5f6`), so workers sharing the provider
-state never collide. Never rotate an ID to retry a consumed Codex fallback.
+state never collide. Never rotate an ID to retry a consumed fallback.
 
 Freeze the eligible issue set at run start unless the user explicitly asks for a
 live backlog. Track each issue as one of:
@@ -60,8 +65,9 @@ For each wave:
 1. Fetch the base again. A dependent issue must start from a base containing its
    merged prerequisites.
 2. Create one unique branch, worktree, state record, and PR per issue.
-3. Spawn at most `--max-parallel` Codex writers while reserving capacity for the
-   root scheduler. A worker owns one issue and must not recursively fan out.
+3. Spawn at most `--max-parallel` Codex workers while reserving capacity for the
+   root scheduler. A worker owns one issue and one worktree, launches exactly
+   one implementer process at a time in it, and must not recursively fan out.
 4. Have each worker follow `issue-pipeline.md` through PR creation and readiness,
    with no merge. Pass through the drain options.
 5. Return compact structured results: issue, worktree, PR, head SHA, gate SHAs,
@@ -78,15 +84,21 @@ Review and merge one PR at a time. Never batch final merge decisions.
 For each PR:
 
 1. If `--skip-review`, leave it open and mark `HELD`; do not auto-merge.
-2. Otherwise require a valid review-gateway result for the exact current head.
-   Use `full-review.md`, or one shorter structured gateway pass with
-   `--basic-review`. Record whether Claude or Codex fallback produced it.
+2. Otherwise require a valid review-gateway result for the exact current head,
+   produced with the plan and Implementation Report as inputs. Use
+   `full-review.md`, or one shorter structured gateway pass with
+   `--basic-review`. Record whether Codex or the Claude fallback produced it.
 3. Require plan adherence unless `--no-verify`, local tests, lint/typecheck,
-   mergeable state, and successful required GitHub checks for the same SHA.
-   Billing, spending-limit, quota, provider, and runner failures are not waivers.
-   A job that did not start or executed no meaningful steps is missing CI
-   evidence. Local parity may diagnose it but cannot satisfy its required GitHub
-   status; restore CI and rerun the same SHA.
+   mergeable state, and successful required GitHub checks for the same SHA —
+   the CI gate in `full-review.md`. `CI_FAILED` goes back through the
+   implementer and a new review round; `CI_MISSING` marks the PR `HELD` with a
+   comment naming the contexts that never reported. Billing, spending-limit,
+   quota, provider, and runner failures are not waivers. A job that did not
+   start or executed no meaningful steps is missing CI evidence. Local parity,
+   the implementer's run, and the reviewer's judgement may diagnose it but
+   cannot satisfy its required GitHub status; restore CI and rerun the same SHA.
+   If every PR in a wave is `HELD` for `CI_MISSING`, CI is down: stop the drain
+   and report instead of processing the next wave.
 4. Fetch the latest base immediately before merge. If rebasing or merging the
    base changes the head, invalidate and rerun local, adherence, reviewer, and
    CI gates. A base-tip change that changes the effective diff also requires a
