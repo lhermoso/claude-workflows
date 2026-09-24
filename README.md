@@ -255,7 +255,7 @@ Autonomous issue processor — analyzes dependencies between issues, batches ind
 | `--code-model=M` | `opus` | Model for coder agents |
 | `--review-model=M` | `fable` | Model for reviewer agents |
 
-**Model routing:** planning (root cause, `.pair/PLAN.md`, the single Codex plan review) and reviewing (plan-adherence verification, Codex finding triage, merge decision) run on **claude-fable-5**, falling back to **opus** if fable is unavailable. Code — tests, implementation, review fixes, commits, PRs — is written by **claude-opus-5**. A planner never implements and a reviewer never edits files; fixes always go back through a coder agent.
+**Model routing:** planning (root cause, `.pair/PLAN.md`, the single Codex plan review) and reviewing (plan-adherence verification, Codex finding triage, merge decision) run on the **`fable`** alias, falling back to **`opus`** if fable is unavailable. Code — tests, implementation, review fixes, commits, PRs — is written by the **`opus`** alias. Aliases always resolve to the latest model of each family; the workflows never pin a full model id. A planner never implements and a reviewer never edits files; fixes always go back through a coder agent.
 
 **How it works:**
 1. Fetches all open issues (or filtered subset), skipping issues assigned to others (unless `--get-all`)
@@ -317,7 +317,7 @@ Full pipeline: create an issue (if needed), fix it, create a PR, and self-review
 | `--code-model=M` | Model for the coder agent (default `opus`) |
 | `--review-model=M` | Model for reviewer agents (default `fable`, fallback `opus`) |
 
-**Model routing:** the plan and every review run on **claude-fable-5** (fallback **opus**); the code is written by **claude-opus-5**. Planner, coder, and reviewer are separate agents — the coder cannot silently redesign the plan (it must return `plan_rejected` instead), and the reviewer cannot edit files.
+**Model routing:** the plan and every review run on the **`fable`** alias (fallback **`opus`**); the code is written by the **`opus`** alias — always the latest of each family, never a pinned id. Planner, coder, and reviewer are separate agents — the coder cannot silently redesign the plan (it must return `plan_rejected` instead), and the reviewer cannot edit files.
 
 **How it works:**
 1. **Detects mode:** number → fix existing issue; text → create new issue first

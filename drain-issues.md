@@ -1,7 +1,7 @@
 ---
 allowed-tools: Bash(git:*), Bash(gh:*), Task
 argument-hint: [label:filter] [--max-parallel=N] [--dry-run] [--get-all] [--no-plan-review] [--basic-review] [--no-verify] [--plan-model=M] [--code-model=M] [--review-model=M]
-description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Plans and reviews run on claude-fable-5 (fallback opus), code is written by claude-opus-5. ALL quality gates ON by default: a single Codex plan review before coding, plan-adherence verification after coding, the Claude↔Codex full-review loop (Codex gets requirements + plan + report + diff, four gates, BLOCKER/HIGH/MEDIUM/LOW), and a CI gate — required checks green on the final SHA — before merge. Opt out with --no-plan-review / --no-verify / --basic-review; the CI gate cannot be opted out.
+description: Autonomous issue processor - analyzes dependencies, batches independent issues, repeats until done. Plans and reviews run on the fable alias (fallback opus), code is written by the opus alias — always the latest model of each family, never a pinned id. ALL quality gates ON by default: a single Codex plan review before coding, plan-adherence verification after coding, the Claude↔Codex full-review loop (Codex gets requirements + plan + report + diff, four gates, BLOCKER/HIGH/MEDIUM/LOW), and a CI gate — required checks green on the final SHA — before merge. Opt out with --no-plan-review / --no-verify / --basic-review; the CI gate cannot be opted out.
 ---
 
 # Autonomous Issue Drainer
@@ -44,9 +44,9 @@ The legacy `--plan-review` / `--full-review` flags are accepted but redundant �
 
 | Role | Covers | Model | Fallback |
 |------|--------|-------|----------|
-| **Planner** | root-cause investigation, writing and revising `.pair/PLAN.md`, running the single Codex plan review and absorbing its findings | `fable` (claude-fable-5) | `opus` |
-| **Reviewer** | plan-adherence verification + Implementation Report, basic diff review, triaging Codex `BLOCKER`/`HIGH` findings, merge decisions | `fable` (claude-fable-5) | `opus` |
-| **Coder** | failing test, implementation, lint/test runs, CHANGELOG, commits, PR creation, applying fixes the reviewer decided to accept | `opus` (claude-opus-5) | — |
+| **Planner** | root-cause investigation, writing and revising `.pair/PLAN.md`, running the single Codex plan review and absorbing its findings | `fable` (alias → latest Fable) | `opus` |
+| **Reviewer** | plan-adherence verification + Implementation Report, basic diff review, triaging Codex `BLOCKER`/`HIGH` findings, merge decisions | `fable` (alias → latest Fable) | `opus` |
+| **Coder** | failing test, implementation, lint/test runs, CHANGELOG, commits, PR creation, applying fixes the reviewer decided to accept | `opus` (alias → latest Opus) | — |
 
 Rules:
 
@@ -60,7 +60,7 @@ Rules:
 8. **Never invoke `codex exec review` — it DISCARDS findings.** Every Codex call in this workflow, plan review and code review alike, uses plain `codex exec - -s <mode> --ephemeral --json` with the prompt on stdin — `read-only` for the plan review and the improvement passes, `workspace-write` (with a writable `TMPDIR`, per `full-review.md`) for the code review so Codex can run the test suite. Measured on a real drain (COTIntelligence, 8 branches): on one branch the `review` subcommand returned a clean 249-character review *after 7 genuine file reads*, while the **same prompt** through `codex exec -` found two real defects and returned `VERDICT: CHANGES_REQUESTED`; across all eight branches the subcommand never once emitted the VERDICT line. So it is not only the verdict line that is lost — the findings are. **A zero-finding review from `codex exec review` is not evidence that a branch is clean; it is no evidence at all.** If one is ever produced, discard it and re-run through plain `codex exec`.
 9. **The code reviewer receives THREE inputs, every iteration:** (1) original requirements — issue body + comments + PR description; (2) the implementation plan — `<worktree>/.pair/PLAN.md` plus the Implementation Report Phase 5.5 wrote to `<worktree>/.pair/REPORT.md`; (3) the diff (`HEAD` vs `origin/<base>`). `$REVIEW_PROMPT` is **always** the Phase 1 template from `~/.claude/commands/full-review.md`, assembled with those inputs. Never send a bare word or a diff-only prompt — without the plan the reviewer cannot check architecture deviations, without the issue it cannot check requirements. Severity is `BLOCKER` / `HIGH` / `MEDIUM` / `LOW` with axis tags `[CORRECTNESS]` / `[AC]` / `[ARCH]` / `[SECURITY]` / `[CI]`; only BLOCKER and HIGH block. Every finding carries file, relevant code, why, reproduction scenario, proposed correction; Codex proposes, the reviewer triages, the coder applies. Codex never edits. **This is why worktrees survive until Phase 6 finishes** — `.pair/` lives only there.
 10. **CI is a gate, not a report.** Codex LGTM alone never merges a PR. `/full-review` Phase 3.5 waits for the checks on the final SHA and requires every required status context green. `CI_FAILED` → `[BLOCKER][CI]` finding, coder fixes, Codex re-reviews. `CI_MISSING` (a check that never ran — billing, quota, runner, provider) is missing evidence, never a pass: hold the PR with a comment and move on. Local test runs, the coder's or Codex's, never substitute. This workflow never changes branch protection and never uses `--admin` to bypass a failing or missing check.
-
+11. **Always aliases, never pinned ids.** Every model reference in this workflow is an alias (`fable`, `opus`, `sonnet`, `haiku`) that Claude Code resolves to the latest model of that family at launch time. Never write a full model id (a `claude-<family>-<version>` string) in a `Task` launch, a flag default, or these docs — a pinned id silently freezes the pipeline on an old model when the family moves. Aliases are also what the `--*-model=M` overrides accept.
 ---
 
 ## CRITICAL: Context Management
